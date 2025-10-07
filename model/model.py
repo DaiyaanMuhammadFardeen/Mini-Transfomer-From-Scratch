@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from .encoder import EncoderLayer
 from .decoder import DecoderLayer
 from .positionalEnc import PositionalEncoding
@@ -42,11 +43,11 @@ class Transformer(nn.Module):
 
         enc_output = src_embedded
         for enc_layer in self.encoder_layers:
-            enc_output = enc_layer(enc_output, src_mask)
+            enc_output = checkpoint(enc_layer, enc_output, src_mask, preserve_rng_state=True, use_reentrant=False)
 
         dec_output = tgt_embedded
         for dec_layer in self.decoder_layers:
-            dec_output = dec_layer(dec_output, enc_output, src_mask, tgt_mask)
+            dec_output = checkpoint(dec_layer, dec_output, enc_output, src_mask, tgt_mask, preserve_rng_state=True, use_reentrant=False)
 
         output = self.fc(dec_output)
         return output
