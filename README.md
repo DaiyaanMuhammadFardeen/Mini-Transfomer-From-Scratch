@@ -38,18 +38,21 @@ Date: Wednesday, October 8, 2025
 - Configured customTokenizer.py to export tokenized vocabularies to disk (src_vocab.pkl, tgt_vocab.pkl) for faster training by skipping repeated tokenization.
 - Added tqdm progress bars to both train.py (for epochs and batches) and customTokenizer.py (for vocabulary building) to track progress and ETA.
 - Parallelized tokenization in customTokenizer.py to use all available CPU cores via multiprocessing for faster vocabulary building.
+- Implement memory optimizations in train.py (e.g., torch.amp for mixed-precision, gradient checkpointing)
 
 #### 🧩 Issues Faced
 
 - Encountered an IndexError: index out of range in self in the embedding layer due to vocabulary indices exceeding src/tgt_vocab_size=5000.
 - Faced a ROCm HSA_STATUS_ERROR_EXCEPTION: code 0x1016 on the GPU due to excessive VRAM usage with initial hyperparameters (max_seq_length=4096, batch_size=16).
 - Lacked visibility into training progress, making it hard to estimate completion time.
+- Faced fp16 numbers getting divided by fp32 numbers during training, leading to incorrect results.
 
 #### 🛠️ How I Fixed It
 
 - Fixed the IndexError by sorting vocabulary by frequency in customTokenizer.py and truncating src_vocab and tgt_vocab to 5000 tokens in train.py, ensuring indices stay within bounds.
 - Resolved the ROCm OOM error by reducing max_seq_length to 256 and batch_size to 1, fitting training within ~3 GB VRAM (verified with theoretical estimates and torch.cuda.memory_allocated()).
 - Added tqdm progress bars in train.py for epoch and batch progress, displaying batch loss and ETA, and in customTokenizer.py for tokenization and vocabulary building.
+- The famouse transformer masking formula uses 1e9 as a constant, so I replaced it with 1e4 to avoid overflow.
 
 #### 💡 What I Learned
 
@@ -60,7 +63,6 @@ Date: Wednesday, October 8, 2025
 
 #### 🎯 Next Steps
 
-- Implement memory optimizations in train.py (e.g., torch.cuda.amp for mixed-precision, gradient checkpointing) to allow larger batch_size or max_seq_length.
 - Enhance the evaluation script with metrics (e.g., BLEU, accuracy) and integrate it into the training loop for periodic validation.
 - Profile and optimize tokenization speed further, possibly caching tokenized data for even faster loading.
 
