@@ -1,8 +1,9 @@
 import torch
-from model.model import Transformer
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
+from model.model import Transformer
 from customTokenizer import CodeDiffDataset, Vocabulary, load_parquet
 import pickle
 from tqdm import tqdm
@@ -57,6 +58,7 @@ transformer = Transformer(
 
 criterion = nn.CrossEntropyLoss(ignore_index=src_vocab.stoi["<PAD>"])
 optimizer = optim.Adam(transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
+scaler = GradScaler("cuda")
 
 transformer.train()
 
@@ -66,11 +68,12 @@ for epoch in range(num_epochs):
         src_data, tgt_data = src_data.to(device), tgt_data.to(device)
 
         optimizer.zero_grad()
-        output = transformer(src_data, tgt_data[:, :-1])  # Exclude <EOS> for input
-        loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))  # Exclude <SOS> for target
-        loss.backward()
-        optimizer.step()
-
+        with autocast("cuda"):
+            output = transformer(src_data, tgt_data[:, :-1])  # Exclude <EOS> for input
+            loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))  # Exclude <SOS> for target
+        scaler.scale(loss).backward()  # Scaled backward to prevent underflow
+        scaler.step(optimizer)
+        scaler.update()
         total_loss += loss.item()
 
     avg_loss = total_loss / len(dataloader)
