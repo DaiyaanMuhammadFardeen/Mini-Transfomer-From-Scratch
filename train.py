@@ -19,7 +19,7 @@ d_ff = 2024
 max_seq_length = 512
 dropout = 0.2
 batch_size = 16
-num_epochs = 3
+num_epochs = 1
 
 file_path = "./dataset_part2.parquet"  # Replace with your parquet file path
 messages, diffs = load_parquet(file_path)
@@ -43,7 +43,7 @@ tgt_vocab_size = len(tgt_vocab.stoi)
 
 # Step 5: Create Dataset and DataLoader
 dataset = CodeDiffDataset(messages, diffs, src_vocab, tgt_vocab, max_seq_length)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=6)
 
 transformer = Transformer(
     src_vocab_size,
