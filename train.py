@@ -66,7 +66,7 @@ num_layers = 6
 d_ff = 2024
 max_seq_length = 1024
 dropout = 0.2
-batch_size = 12
+batch_size = 10
 num_epochs = 3
 print(f"\033[92m📊 Hyperparameters set - src_vocab_size: {src_vocab_size}, tgt_vocab_size: {tgt_vocab_size}, epochs: {num_epochs}\033[0m", file=sys.stderr)
 
