@@ -13,8 +13,9 @@ class CodeDiffDataset(Dataset):
         return len(self.messages)
 
     def __getitem__(self, idx):
-        src_text = self.messages[idx]
-        tgt_text = self.diffs[idx]
+        ## Fixed: src should be diffs, tgt should be messages
+        src_text = self.diffs[idx]
+        tgt_text = self.messages[idx]
 
         src_tokens = self.tokenize_text(src_text, self.src_vocab)
         tgt_tokens = self.tokenize_text(tgt_text, self.tgt_vocab)
