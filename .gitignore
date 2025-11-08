@@ -24,7 +24,6 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 gpucore.*
-*.pkl
 *.parquet
 *.egg
 MANIFEST
@@ -163,7 +162,6 @@ venv.bak/
 dmypy.json
 
 *.json
-*.pkl
 # Pyre type checker
 .pyre/
 
