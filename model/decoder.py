@@ -1,16 +1,28 @@
+import torch
 import torch.nn as nn
-from .attention import MultiHeadAttention, KernelizedMultiHeadAttention
+from .attention import MultiHeadAttention
 from .positionalFF import PositionWiseFeedForward
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+    
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
 
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout):
         super(DecoderLayer, self).__init__()
-        self.self_attn = KernelizedMultiHeadAttention(d_model, num_heads)
-        self.cross_attn = KernelizedMultiHeadAttention(d_model, num_heads)
+        # Changed from KernelizedMultiHeadAttention to standard MultiHeadAttention
+        self.self_attn = MultiHeadAttention(d_model, num_heads)
+        self.cross_attn = MultiHeadAttention(d_model, num_heads)
         self.feed_forward = PositionWiseFeedForward(d_model, d_ff)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        self.norm3 = RMSNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x, enc_output, src_mask, tgt_mask):
