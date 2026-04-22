@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from .attention import MultiHeadAttention
-from .positionalFF import PositionWiseFeedForward
+from .attentions.MultiHeadAttention import MultiHeadAttention
+from .positionalFF import SwiGLU
 
 class RMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-6):
@@ -18,7 +18,7 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
         # Changed from KernelizedMultiHeadAttention to standard MultiHeadAttention
         self.self_attn = MultiHeadAttention(d_model, num_heads)
-        self.feed_forward = PositionWiseFeedForward(d_model, d_ff)
+        self.feed_forward = SwiGLU(d_model, d_ff, bias=False)
         self.norm1 = RMSNorm(d_model)
         self.norm2 = RMSNorm(d_model)
         self.dropout = nn.Dropout(dropout)

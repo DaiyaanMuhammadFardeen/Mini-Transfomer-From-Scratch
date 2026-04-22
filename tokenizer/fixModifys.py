@@ -95,7 +95,7 @@ def get_ordered_leaves_with_gaps(root_node, source_bytes, max_depth=75):
 def process_modify_line(line):
     # Check for both <MODIFY> and <COMMENT_MODIFY> tags
     if not (
-        (line.startswith('<MODIFY>') and line.endswith('</MODIFY>')) or 
+        (line.startswith('<MODIFY>') and line.endswith('</MODIFY>')) or
         (line.startswith('<COMMENT_MODIFY>') and line.endswith('</COMMENT_MODIFY>'))
     ) or ' → ' not in line:
         return line
@@ -107,7 +107,7 @@ def process_modify_line(line):
     else:  # <COMMENT_MODIFY>
         tag_start = '<COMMENT_MODIFY>'
         tag_end = '</COMMENT_MODIFY>'
-    
+
     content = line[len(tag_start):-len(tag_end)]
     try:
         before, after = content.split(' → ', 1)
@@ -225,8 +225,8 @@ def process_batch(batch_data):
     return results
 
 def main():
-    input_path = "./dataset_part1.parquet"
-    output_path = "./cleaned_dataset_part2.parquet"
+    input_path = "./rebalanced_data_3.parquet"
+    output_path = "./rebalanced_data_fixed.parquet"
 
     print("📖 Loading dataset...", file=sys.stderr)
     df = pd.read_parquet(input_path)

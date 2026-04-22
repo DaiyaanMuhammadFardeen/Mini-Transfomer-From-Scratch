@@ -104,6 +104,39 @@ def main():
             sample_keys = list(vocab.keys())[:10]
             print(f"   Sample tokens: {sample_keys}")
 
+    print("\n=== EMBEDDING-SPECIFIC TOKENS ANALYSIS ===")
+    # Check for embedding-specific tokens
+    embedding_tokens = [
+        '<BUG_FIX>', '<FEATURE_ADD>', '<REFACTOR>', '<OPTIMIZATION>',
+        '<DOC_UPDATE>', '<TEST_ADD>', '<CONFIG_CHANGE>',
+        '<CAMEL_CASE>', '<SNAKE_CASE>', '<PASCAL_CASE>', '<CONSTANT_CASE>',
+        '<INDENT_STYLE>', '<LINE_LENGTH>', '<COMMENT_STYLE>',
+        '<IMPORT>', '<EXPORT>', '<DEPENDENCY>', '<LIBRARY>',
+        '<PACKAGE>', '<MODULE>', '<FRAMEWORK>',
+        '<SECURITY_FIX>', '<VULNERABILITY>', '<PERMISSION>', '<AUTH>',
+        '<PERFORMANCE>', '<BOTTLENECK>', '<OPTIMIZATION>',
+        '<ERROR>', '<EXCEPTION>', '<TRY_CATCH>', '<RAISE>',
+        '<API_CHANGE>', '<ENDPOINT>', '<PARAMETER>', '<RESPONSE>',
+        '<COMPLEXITY>', '<CYCLOMATIC>', '<COGNITIVE>',
+        '<DOMAIN>', '<BUSINESS_LOGIC>', '<UI_CHANGE>', '<BACKEND>',
+        '<TEST>', '<UNIT_TEST>', '<INTEGRATION_TEST>', '<MOCK>',
+        '<FUNCTION>', '<CLASS>', '<METHOD>', '<VARIABLE>',
+        '<LOOP>', '<CONDITIONAL>', '<EXPRESSION>', '<STATEMENT>',
+        '<TIMESTAMP>', '<VERSION>', '<RELEASE>', '<DEPRECATED>',
+        '<REVIEWED>', '<APPROVED>', '<WIP>', '<CO_AUTHOR>'
+    ]
+    
+    found_embedding_tokens = []
+    for token in embedding_tokens:
+        if token in tokenizer.stoi:
+            found_embedding_tokens.append(token)
+    
+    print(f"✅ Found {len(found_embedding_tokens)} embedding-specific tokens:")
+    for token in found_embedding_tokens[:20]:  # Show first 20
+        print(f"   - {token}: {tokenizer.stoi[token]}")
+    if len(found_embedding_tokens) > 20:
+        print(f"   ... and {len(found_embedding_tokens) - 20} more")
+
     print("\n=== SUMMARY ===")
     if vocab_candidates:
         print(f"Total possible vocabularies found: {len(vocab_candidates)}")
@@ -114,4 +147,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

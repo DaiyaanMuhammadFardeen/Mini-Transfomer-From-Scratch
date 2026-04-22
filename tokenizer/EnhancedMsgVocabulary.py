@@ -17,13 +17,13 @@ import json
 from programming_terms import extract_programming_terms, create_programming_tokens
 
 
-class MsgVocabulary:
+class EnhancedMsgVocabulary:
     """
     Enhanced BPE tokenizer that incorporates embedding-specific tokens for commit messages.
     Uses chunked parallel processing to maximize CPU utilization.
     """
 
-    def __init__(self, vocab_size: int = 10000, min_frequency: int = 500):
+    def __init__(self, vocab_size: int = 5000, min_frequency: int = 2):
         self.vocab_size = vocab_size
         self.min_frequency = min_frequency
         self.n_workers = max(1, cpu_count())
@@ -67,7 +67,7 @@ class MsgVocabulary:
             # Collaborative tokens
             '<REVIEWED>', '<APPROVED>', '<WIP>', '<CO_AUTHOR>'
         ]
-
+        
         self._initialize_special_tokens()
         self.is_trained = False
 
@@ -99,18 +99,18 @@ class MsgVocabulary:
             r'\b(test|unittest|pytest|assert|mock|spec|testing)\b': '<TEST_ADD>',
             r'\b(test_|_test|spec_|_spec)\w+': '<TEST_ADD>',
         }
-
+        
         tokens = []
         for pattern, token in change_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_code_style_tokens(self, text: str) -> List[str]:
         """Extract tokens related to code style from commit message"""
         style_tokens = []
-
+        
         # Check for naming conventions in commit message
         if re.search(r'[a-z]+(?:[A-Z][a-z]*)+', text):  # camelCase
             style_tokens.append('<CAMEL_CASE>')
@@ -120,7 +120,7 @@ class MsgVocabulary:
             style_tokens.append('<PASCAL_CASE>')
         if re.search(r'[A-Z]+(?:_[A-Z]+)+', text):  # CONSTANT_CASE
             style_tokens.append('<CONSTANT_CASE>')
-
+        
         # Check for common style patterns in commit message
         if re.search(r'\bdef\s+\w+\s*\(', text):  # Function definitions
             style_tokens.append('<FUNCTION>')
@@ -130,7 +130,7 @@ class MsgVocabulary:
             style_tokens.append('<INDENT_STYLE>')
         if re.search(r'#.*', text):  # Comments
             style_tokens.append('<COMMENT_STYLE>')
-
+        
         return style_tokens
 
     def _extract_security_tokens(self, text: str) -> List[str]:
@@ -141,12 +141,12 @@ class MsgVocabulary:
             r'\b(vuln|vulnerability|exploit|attack|secure|insecure|permission|privilege)\b': '<VULNERABILITY>',
             r'\b(permission|access|grant|revoke|admin|root|sudo)\b': '<PERMISSION>',
         }
-
+        
         tokens = []
         for pattern, token in security_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_dependency_tokens(self, text: str) -> List[str]:
@@ -157,12 +157,12 @@ class MsgVocabulary:
             r'\b(dependency|depend|requires?|requirement)\b': '<DEPENDENCY>',
             r'\b(pip|npm|yarn|gradle|maven|poetry|conda)\b': '<PACKAGE>',
         }
-
+        
         tokens = []
         for pattern, token in dep_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_performance_tokens(self, text: str) -> List[str]:
@@ -172,12 +172,12 @@ class MsgVocabulary:
             r'\b(bottleneck|memory|cpu|gpu|latency|throughput|bandwidth)\b': '<BOTTLENECK>',
             r'\b(cache|buffer|memory|allocation|gc|garbage collection)\b': '<OPTIMIZATION>',
         }
-
+        
         tokens = []
         for pattern, token in perf_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_error_tokens(self, text: str) -> List[str]:
@@ -188,12 +188,12 @@ class MsgVocabulary:
             r'\b(AssertionError|ValueError|TypeError|RuntimeError|Exception)\b': '<EXCEPTION>',
             r'\b(warning|warn|log|debug|trace|info|error)\b': '<ERROR>',
         }
-
+        
         tokens = []
         for pattern, token in error_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_api_tokens(self, text: str) -> List[str]:
@@ -204,12 +204,12 @@ class MsgVocabulary:
             r'\b(param|parameter|query|header|body|payload|json|xml)\b': '<PARAMETER>',
             r'\b(response|status|code|success|error|ok|200|404|500)\b': '<RESPONSE>',
         }
-
+        
         tokens = []
         for pattern, token in api_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_complexity_tokens(self, text: str) -> List[str]:
@@ -219,12 +219,12 @@ class MsgVocabulary:
             r'\b(cyclomatic|branch|if|elif|else|switch|case)\b': '<CYCLOMATIC>',
             r'\b(cognitive|thinking|understand|readable|clear|obvious)\b': '<COGNITIVE>',
         }
-
+        
         tokens = []
         for pattern, token in complexity_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_domain_tokens(self, text: str) -> List[str]:
@@ -235,12 +235,12 @@ class MsgVocabulary:
             r'\b(ui|user|interface|frontend|view|component|display|render)\b': '<UI_CHANGE>',
             r'\b(backend|server|api|database|model|engine|core|service)\b': '<BACKEND>',
         }
-
+        
         tokens = []
         for pattern, token in domain_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_testing_tokens(self, text: str) -> List[str]:
@@ -251,12 +251,12 @@ class MsgVocabulary:
             r'\b(integration|integration_test|end_to_end|e2e)\b': '<INTEGRATION_TEST>',
             r'\b(mock|stub|fake|spy|double|test_double)\b': '<MOCK>',
         }
-
+        
         tokens = []
         for pattern, token in testing_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_syntactic_tokens(self, text: str) -> List[str]:
@@ -270,12 +270,12 @@ class MsgVocabulary:
             r'\b(if|elif|else|switch|case|ternary)\b': '<CONDITIONAL>',
             r'\b(return|yield|break|continue)\b': '<STATEMENT>',
         }
-
+        
         tokens = []
         for pattern, token in syntactic_patterns.items():
             if re.search(pattern, text, re.IGNORECASE):
                 tokens.append(token)
-
+        
         return tokens
 
     def _extract_programming_tokens(self, text: str) -> List[str]:
@@ -301,14 +301,14 @@ class MsgVocabulary:
         tokens.extend(self._extract_testing_tokens(text))
         tokens.extend(self._extract_syntactic_tokens(text))
         tokens.extend(self._extract_programming_tokens(text))  # NEW: Add programming terms
-
+        
         return list(set(tokens))  # Remove duplicates
 
     def pre_tokenize(self, text: str) -> List[str]:
         """Enhanced pre-tokenization that extracts embedding tokens and normalizes text."""
         # Extract embedding-specific tokens first
         embedding_tokens = self._extract_embedding_tokens(text)
-
+        
         # Normalize and split the main text
         text = ' '.join(text.split())
         pattern = r"""
@@ -321,7 +321,7 @@ class MsgVocabulary:
             (?:[^\w\s])
         """
         main_tokens = re.findall(pattern, text, re.VERBOSE)
-
+        
         # Combine embedding tokens with main tokens
         return embedding_tokens + main_tokens
 
@@ -421,25 +421,20 @@ class MsgVocabulary:
         word_counts = Counter()
         for text in texts:
             if text and text.strip():
-                # Extract embedding tokens first
-                embedding_tokens = []
-                # Add programming tokens
-                terms = extract_programming_terms(text)
-                embedding_tokens.extend(create_programming_tokens(terms))
-
-                # Add other embedding tokens
-                embedding_tokens.extend([
+                tokens = []
+                # Extract embedding tokens
+                embedding_tokens = [
                     '<BUG_FIX>', '<FEATURE_ADD>', '<REFACTOR>', '<OPTIMIZATION>',
                     '<DOC_UPDATE>', '<TEST_ADD>', '<CONFIG_CHANGE>', '<PERFORMANCE>',
                     '<SECURITY_FIX>', '<ERROR>', '<API_CHANGE>', '<COMPLEXITY>',
                     '<DOMAIN>', '<TEST>', '<FUNCTION>', '<CLASS>', '<VARIABLE>'
-                ])
-
+                ]
+                
                 # Check for embedding tokens in text
                 for token in embedding_tokens:
                     if token.lower().replace('<', '').replace('>', '').replace('_', ' ') in text.lower():
-                        word_counts[token] += 1
-
+                        tokens.append(token)
+                
                 # Process the actual text
                 text = ' '.join(text.split())
                 pattern = r"""
@@ -451,7 +446,8 @@ class MsgVocabulary:
                     (?:\w+)|
                     (?:[^\w\s])
                 """
-                tokens = re.findall(pattern, text.lower(), re.VERBOSE)
+                tokens.extend(re.findall(pattern, text.lower(), re.VERBOSE))
+                
                 word_counts.update(tokens)
         return word_counts
 
@@ -571,7 +567,7 @@ class MsgVocabulary:
                     pbar.update(5)
 
                 # Periodic logging
-                if verbose and merge_count % 50 == 0:
+                if verbose and merge_count % 500 == 0:
                     print(f"\n\033[96m📊 {merge_count:,}/{num_merges:,} ({100*merge_count/num_merges:.1f}%)\033[0m", file=sys.stderr)
                     print(f"\033[96m   '{best_pair[0]}'+'{best_pair[1]}' → '{merged_token}' (freq: {best_freq:,})\033[0m", file=sys.stderr)
                     print(f"\033[96m   Unique word forms: {len(word_freqs):,}\033[0m", file=sys.stderr)
@@ -595,14 +591,14 @@ class MsgVocabulary:
 
         # Extract embedding tokens first
         embedding_tokens = self._extract_embedding_tokens(text)
-
+        
         # Tokenize the main text
         words = self.pre_tokenize(text.lower())
         # Filter out the embedding tokens from the main text to avoid duplication
         main_tokens = [w for w in words if w not in self.special_tokens]
-
+        
         tokens = embedding_tokens  # Add embedding tokens first
-
+        
         for word in main_tokens:
             word_tokens = list(word) + ['</w>']
 

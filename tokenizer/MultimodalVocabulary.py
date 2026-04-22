@@ -22,7 +22,7 @@ from typing import Dict, List, Set, Tuple, Optional, Any
 from programming_terms import extract_programming_terms, create_programming_tokens
 
 
-class DiffVocabulary:
+class MultimodalVocabulary:
     """
     Enhanced vocabulary builder that creates tokens specifically designed to work with
     multiple embedding layers. It incorporates information from different embedding types
@@ -121,7 +121,7 @@ class DiffVocabulary:
                 lib.tree_sitter_python.restype = ctypes.c_void_p
                 PY_LANGUAGE = Language(lib.tree_sitter_python())
                 self._parser = Parser(language=PY_LANGUAGE)
-                # print(f"[DEBUG] Tree-sitter parser loaded successfully from {lib_path}", file=sys.stderr)
+                print(f"[DEBUG] Tree-sitter parser loaded successfully from {lib_path}", file=sys.stderr)
             except Exception as e:
                 print(f"[ERROR] Failed to load tree-sitter: {e}", file=sys.stderr)
                 raise

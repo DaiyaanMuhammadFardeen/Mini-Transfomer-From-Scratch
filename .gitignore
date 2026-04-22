@@ -212,3 +212,9 @@ checkpoints/
 *.pth
 .idea/
 *.csv
+Papers/
+pictures/
+myenv/
+PreTrainedModels
+reports/
+tokenizer_checkpoints/

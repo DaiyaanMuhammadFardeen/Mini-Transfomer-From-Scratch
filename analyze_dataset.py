@@ -104,7 +104,7 @@ def analyze_sequence_lengths(file_path, diff_vocab_path, message_vocab_path):
     print(f"\nOutliers: {outliers} ({100*outliers/len(message_lengths):.2f}%)")
 
 if __name__ == "__main__":
-    data_path = "./train_data.parquet"
+    data_path = "./traindata.parquet"
     diff_vocab_path = "./tokenizer/diff_vocab.pkl"
     message_vocab_path = "./tokenizer/message_vocab.pkl"
     

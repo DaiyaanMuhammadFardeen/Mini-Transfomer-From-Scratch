@@ -9,6 +9,7 @@ import argparse
 from torch.utils.data import DataLoader, random_split
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
+from torch.utils.checkpoint import checkpoint
 from model.model import Transformer
 from CodeDiffDataset import CodeDiffDataset
 from tqdm import tqdm
@@ -61,7 +62,7 @@ def load_data(file_path):
     print(f"\033[96m📂 load_data() called with file_path: {file_path}\033[0m", file=sys.stderr)
     print(f"\033[96m📖 Reading parquet file...\033[0m", file=sys.stderr)
     df = pd.read_parquet(file_path)
-    df = df.sample(frac=0.1, random_state=42) # random_state for reproducibility
+    # df = df.sample(frac=0.2, random_state=42) # random_state for reproducibility
     print(f"\033[92m✓ Parquet file loaded, shape: {df.shape}\033[0m", file=sys.stderr)
     df['diff_text'] = df['diff_text'].fillna('')
     df['message'] = df['message'].fillna('')
@@ -91,6 +92,101 @@ def length_regularization_loss(output, tgt_data, eos_idx, min_length=5, lambda_l
     # Penalize if predicted length < min_length
     length_penalty = torch.clamp(min_length - pred_lengths.float(), min=0) ** 2
     return lambda_len * length_penalty.mean()
+
+def contrastive_loss(embeddings, labels, temperature=0.1, margin=1.0):
+    """
+    Compute contrastive loss to encourage similar embeddings for similar messages
+    and dissimilar embeddings for different messages.
+
+    Args:
+        embeddings: Encoded representations of inputs (batch_size, embedding_dim)
+        labels: Ground truth labels (batch_size,)
+        temperature: Temperature for scaling similarities
+        margin: Margin for negative pairs
+
+    Returns:
+        contrastive_loss: Scalar loss value
+    """
+    # Normalize embeddings
+    embeddings = torch.nn.functional.normalize(embeddings, dim=1)
+
+    # Compute pairwise cosine similarities
+    similarity_matrix = torch.matmul(embeddings, embeddings.t()) / temperature
+
+    # Create positive and negative masks
+    labels = labels.unsqueeze(0)
+    positive_mask = (labels == labels.t()).float()
+    negative_mask = 1 - positive_mask
+
+    # Remove self-similarities
+    eye = torch.eye(positive_mask.size(0), device=positive_mask.device)
+    positive_mask = positive_mask - eye
+
+    # Compute loss for positive pairs (pull similar closer)
+    positive_loss = -torch.log(torch.exp(similarity_matrix) * positive_mask).sum() / positive_mask.sum().clamp(min=1)
+
+    # Compute loss for negative pairs (push dissimilar apart)
+    negative_loss = torch.relu(margin - similarity_matrix) * negative_mask
+    negative_loss = negative_loss.sum() / negative_mask.sum().clamp(min=1)
+
+    return positive_loss + negative_loss
+
+def diversity_loss(output, tgt_data, vocab_size, diversity_weight=0.01):
+    """
+    Compute diversity loss to penalize repetitive outputs.
+
+    Args:
+        output: Model output logits (batch_size, seq_len, vocab_size)
+        tgt_data: Target data (batch_size, seq_len)
+        vocab_size: Size of vocabulary
+        diversity_weight: Weight for diversity loss
+
+    Returns:
+        diversity_loss: Scalar loss value
+    """
+    batch_size, seq_len, _ = output.shape
+
+    # Convert logits to probabilities
+    probs = torch.softmax(output, dim=-1)
+
+    # Compute entropy for each position
+    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+
+    # Average entropy across sequence
+    avg_entropy = torch.mean(entropy)
+
+    # Diversity loss is negative entropy (encourage higher entropy, more diverse outputs)
+    return -diversity_weight * avg_entropy
+
+def ngram_repetition_penalty(logits, generated_tokens, n=2, penalty=1.0):
+    """
+    Apply n-gram repetition penalty to logits.
+
+    Args:
+        logits: Current logits (batch_size, vocab_size)
+        generated_tokens: Previously generated tokens (batch_size, seq_len)
+        n: N-gram size
+        penalty: Penalty factor
+
+    Returns:
+        penalized_logits: Logits with repetition penalty applied
+    """
+    if generated_tokens.size(1) < n:
+        return logits
+
+    batch_size, vocab_size = logits.shape
+
+    for i in range(batch_size):
+        # Get last n-1 tokens
+        if generated_tokens.size(1) >= n-1:
+            last_tokens = generated_tokens[i, -(n-1):].tolist()
+
+            # Simple penalty - could be made more sophisticated
+            for token in last_tokens:
+                if 0 <= token < vocab_size:  # Make sure token is valid
+                    logits[i, token] -= penalty
+
+    return logits
 
 def load_checkpoint(checkpoint_path, transformer, optimizer, scheduler, scaler, device):
     """Load checkpoint and resume training state."""
@@ -210,6 +306,14 @@ def main(args):
     transformer.train()
     print(f"\033[92m✓ Model training mode enabled\033[0m", file=sys.stderr)
 
+    # Add new hyperparameters for contrastive learning
+    contrastive_weight = 0.1  # Weight for contrastive loss
+    temperature = 0.1  # Temperature for contrastive loss
+
+    # Add new hyperparameters for diversity loss
+    diversity_weight = 0.01  # Weight for diversity loss
+    repetition_penalty = 1.0  # Penalty for repeated tokens
+
     # Resume from checkpoint if specified
     start_epoch = 0
     best_val_loss = float('inf')
@@ -233,14 +337,51 @@ def main(args):
         for batch_idx, (src_data, tgt_data) in enumerate(pbar):
             src_data, tgt_data = src_data.to(device), tgt_data.to(device)
             optimizer.zero_grad()
+
             with autocast("cuda" if device.type == 'cuda' else "cpu"):
+                # For now, call the model without additional features (backward compatibility)
+                # In a full implementation, we would extract and pass multimodal features
                 output = transformer(src_data, tgt_data[:, :-1])
+
                 # Cross-entropy loss
                 ce_loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+
                 # Length regularization loss
                 len_loss = length_regularization_loss(output, tgt_data, tgt_vocab.stoi["<EOS>"], min_length=5, lambda_len=0.01)
+
+                # Contrastive loss - use encoder output as embeddings
+                with torch.no_grad():
+                    # Get encoder representations for contrastive loss
+                    src_mask, _ = transformer.generate_mask(src_data, tgt_data[:, :-1])
+                    # Use the model's embedding method if available, otherwise use basic embedding
+                    try:
+                        src_embedded = transformer.encoder_embedding(src_data, None)  # Pass None for features
+                    except:
+                        # Fallback to basic embedding if multimodal embedding fails
+                        src_embedded = transformer.dropout(transformer.encoder_embedding.token_embedding(src_data))
+                    
+                    enc_output = src_embedded
+                    for enc_layer in transformer.encoder_layers:
+                        enc_output = checkpoint(
+                            enc_layer,
+                            enc_output,
+                            src_mask,
+                            preserve_rng_state=True,
+                            use_reentrant=False
+                        )
+
+                    # Use mean pooled encoder output as embeddings
+                    embeddings = enc_output.mean(dim=1)  # (batch_size, d_model)
+
+                # Compute contrastive loss
+                # cont_loss = contrastive_loss(embeddings, tgt_data[:, 1], temperature) if contrastive_weight > 0 else 0
+
+                # Compute diversity loss
+                div_loss = diversity_loss(output, tgt_data[:, 1:], tgt_vocab_size, diversity_weight) if diversity_weight > 0 else 0
+
                 # Combined loss
-                loss = ce_loss + len_loss
+                loss = ce_loss + len_loss + div_loss  # Removed contrastive_weight which was a constant
+                loss = torch.clamp(loss, min=-1e6, max=1e6)  # Adjust bounds as needed
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -260,6 +401,7 @@ def main(args):
             for src_data, tgt_data in pbar:
                 src_data, tgt_data = src_data.to(device), tgt_data.to(device)
                 with autocast("cuda"):
+                    # For validation, call the model without additional features (backward compatibility)
                     output = transformer(src_data, tgt_data[:, :-1])
                     loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
                 total_val_loss += loss.item()
@@ -304,18 +446,18 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Transformer model for commit message generation")
-    parser.add_argument("--data-path", default="./train_data.parquet", help="Path to parquet file")
+    parser.add_argument("--data-path", default="./traindata.parquet", help="Path to parquet file")
     parser.add_argument("--diff-vocab-path", default="./tokenizer/diff_vocab.pkl", help="Path to diff vocabulary")
     parser.add_argument("--message-vocab-path", default="./tokenizer/message_vocab.pkl", help="Path to message vocabulary")
     parser.add_argument("--checkpoint-dir", default="./checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--d-model", type=int, default=1024, help="Model dimension")
+    parser.add_argument("--d-model", type=int, default=512, help="Model dimension")
     parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
-    parser.add_argument("--num-layers", type=int, default=4, help="Number of transformer layers")
+    parser.add_argument("--num-layers", type=int, default=2, help="Number of transformer layers")
     parser.add_argument("--d-ff", type=int, default=2048, help="Feed-forward dimension")
     parser.add_argument("--max-seq-length", type=int, default=256, help="Maximum sequence length") #avg for diff is 128, for message is 12, max is 120. It used to be 1024
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num-epochs", type=int, default=5, help="Number of epochs")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
+    parser.add_argument("--num-epochs", type=int, default=3, help="Number of epochs")
     parser.add_argument("--learning-rate", type=float, default=0.00001, help="Learning rate")
     parser.add_argument("--resume", default=None, type=str, help="Path to checkpoint to resume training from (e.g., ./checkpoints/transformer_epoch_4.pth)")
     args = parser.parse_args()

@@ -160,6 +160,279 @@ def tokenize_and_pad(text, vocab, max_length):
     return ids[:max_length]
 
 
+def ngram_repetition_penalty(logits, generated_tokens, n=2, penalty=1.0):
+    """
+    Apply n-gram repetition penalty to logits during generation.
+    
+    Args:
+        logits: Current logits (vocab_size,) or (batch_size, vocab_size)
+        generated_tokens: Previously generated tokens (seq_len,) or (batch_size, seq_len)
+        n: N-gram size
+        penalty: Penalty factor (higher = stronger penalty)
+        
+    Returns:
+        penalized_logits: Logits with repetition penalty applied
+    """
+    if generated_tokens.size(-1) < n:
+        return logits
+    
+    # Handle both single sample and batch cases
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+        generated_tokens = generated_tokens.unsqueeze(0)
+        squeeze_end = True
+    else:
+        squeeze_end = False
+    
+    batch_size, vocab_size = logits.shape
+    
+    for i in range(batch_size):
+        # Get last n-1 tokens
+        if generated_tokens.size(-1) >= n-1:
+            # Handle both 1D and 2D tensor indexing
+            if generated_tokens.dim() == 1:
+                last_tokens = generated_tokens[-(n-1):].tolist()
+            else:
+                last_tokens = generated_tokens[i, -(n-1):].tolist()
+            
+            # Apply penalty to repeated tokens
+            for token in last_tokens:
+                if 0 <= token < vocab_size:  # Make sure token is valid
+                    logits[i, token] -= penalty
+    
+    return logits.squeeze(0) if squeeze_end else logits
+
+
+def compute_similarity(text1, text2):
+    """
+    Compute similarity between two texts using simple word overlap.
+    In practice, you might want to use more sophisticated methods like embeddings.
+    """
+    words1 = set(text1.lower().split())
+    words2 = set(text2.lower().split())
+    
+    if not words1 and not words2:
+        return 1.0
+    if not words1 or not words2:
+        return 0.0
+        
+    intersection = words1.intersection(words2)
+    union = words1.union(words2)
+    
+    return len(intersection) / len(union)
+
+
+def mmr_rerank(candidates, diff_text, lambda_param=0.7):
+    """
+    Rerank candidates using Maximum Marginal Relevance.
+    
+    Args:
+        candidates: List of (text, score) tuples
+        diff_text: Source diff text
+        lambda_param: Trade-off parameter between relevance and diversity (0=diverse, 1=relevant)
+        
+    Returns:
+        Reranked list of candidates
+    """
+    if len(candidates) <= 1:
+        return candidates
+    
+    # Start with the best candidate by original score
+    selected = [candidates[0]]
+    remaining = candidates[1:]
+    
+    while remaining and len(selected) < len(candidates):
+        best_candidate = None
+        best_mmr_score = -float('inf')
+        
+        # For each remaining candidate, compute MMR score
+        for candidate in remaining:
+            candidate_text, original_score = candidate
+            
+            # Relevance component (similarity to source diff)
+            relevance = compute_similarity(diff_text, candidate_text)
+            
+            # Diversity component (distance to already selected candidates)
+            min_distance = float('inf')
+            for selected_text, _ in selected:
+                distance = 1 - compute_similarity(candidate_text, selected_text)
+                min_distance = min(min_distance, distance)
+            
+            # MMR score
+            mmr_score = lambda_param * relevance - (1 - lambda_param) * min_distance
+            
+            if mmr_score > best_mmr_score:
+                best_mmr_score = mmr_score
+                best_candidate = candidate
+        
+        if best_candidate:
+            selected.append(best_candidate)
+            remaining.remove(best_candidate)
+        else:
+            break
+    
+    return selected
+
+
+def diversity_beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
+                                  max_seq_length, max_gen_length=100, beam_width=5, 
+                                  length_penalty=1.0, repetition_penalty=1.2, 
+                                  ngram_size=2, use_mmr=False, mmr_lambda=0.7,
+                                  debug=True):
+    """
+    Generate commit message using beam search with diversity enhancements.
+    
+    Args:
+        model: Trained transformer model
+        diff_text: Source diff text
+        src_vocab: Source vocabulary
+        tgt_vocab: Target vocabulary
+        device: torch device
+        max_seq_length: Maximum sequence length
+        max_gen_length: Maximum generation length
+        beam_width: Number of beams to keep
+        length_penalty: Length penalty factor
+        repetition_penalty: Penalty for repeated tokens
+        ngram_size: N-gram size for repetition penalty
+        use_mmr: Whether to use MMR reranking
+        mmr_lambda: MMR trade-off parameter
+        debug: Print debug information
+    
+    Returns:
+        Generated commit message string
+    """
+    # Tokenize source
+    src_ids = tokenize_and_pad(diff_text, src_vocab, max_seq_length)
+    src_tensor = torch.tensor([src_ids], dtype=torch.long).to(device)
+    
+    # Special tokens
+    sos_id = tgt_vocab.stoi["<SOS>"]
+    eos_id = tgt_vocab.stoi["<EOS>"]
+    pad_id = tgt_vocab.stoi["<PAD>"]
+    
+    if debug:
+        print(f"\n\033[96m{'='*70}\033[0m", file=sys.stderr)
+        print(f"\033[96m🔍 DIVERSITY-ENHANCED BEAM SEARCH - Width={beam_width}\033[0m", file=sys.stderr)
+        print(f"\033[96m{'='*70}\033[0m", file=sys.stderr)
+    
+    # Initialize beams: (sequence, score)
+    beams = [([sos_id], 0.0)]
+    completed_beams = []
+    
+    with torch.no_grad():
+        # Get encoder output once
+        src_mask, _ = model.generate_mask(src_tensor, src_tensor)
+        src_embedded = model.dropout(model.encoder_embedding(src_tensor))
+        enc_output = src_embedded
+        for enc_layer in model.encoder_layers:
+            enc_output = enc_layer(enc_output, src_mask)
+    
+    for gen_step in range(max_gen_length):
+        candidates = []
+        
+        with torch.no_grad():
+            for seq, score in beams:
+                # Prepare decoder input
+                tgt_tensor = torch.tensor([seq], dtype=torch.long).to(device)
+                
+                # Create target mask
+                _, tgt_mask = model.generate_mask(src_tensor, tgt_tensor)
+                
+                # Forward pass
+                tgt_embedded = model.dropout(model.decoder_embedding(tgt_tensor))
+                dec_output = tgt_embedded
+                for dec_layer in model.decoder_layers:
+                    dec_output = dec_layer(dec_output, enc_output, src_mask, tgt_mask)
+                
+                # Get logits for last position
+                logits = model.fc(dec_output[:, -1, :])
+                
+                # Apply repetition penalty
+                seq_tensor = torch.tensor(seq, dtype=torch.long).to(device)
+                logits = ngram_repetition_penalty(logits, seq_tensor, ngram_size, repetition_penalty)
+                
+                # Convert to log probabilities
+                log_probs = torch.log_softmax(logits, dim=-1)
+                
+                # Get top-k candidates
+                top_k_probs, top_k_indices = torch.topk(log_probs, beam_width)
+                
+                for i in range(beam_width):
+                    token_id = top_k_indices[0, i].item()
+                    token_score = top_k_probs[0, i].item()
+                    
+                    new_seq = seq + [token_id]
+                    new_score = score + token_score
+                    
+                    # Apply length penalty
+                    if length_penalty > 0:
+                        new_score = new_score / (len(new_seq) ** length_penalty)
+                    
+                    candidates.append((new_seq, new_score))
+        
+        # Sort candidates by score
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Select top beams
+        beams = []
+        for seq, score in candidates:
+            if seq[-1] == eos_id:
+                completed_beams.append((seq, score))
+            else:
+                beams.append((seq, score))
+            
+            if len(beams) == beam_width:
+                break
+        
+        # If all beams are complete, stop
+        if len(beams) == 0:
+            break
+    
+    # Add any remaining beams to completed
+    completed_beams.extend(beams)
+    
+    # Sort completed beams by score
+    completed_beams.sort(key=lambda x: x[1], reverse=True)
+    
+    if debug:
+        print(f"\n\033[96mTop {min(3, len(completed_beams))} candidates:\033[0m", file=sys.stderr)
+        for i, (seq, score) in enumerate(completed_beams[:3]):
+            # Convert to text
+            tokens = []
+            for idx in seq[1:]:  # Skip SOS
+                if idx == eos_id:
+                    break
+                if idx in tgt_vocab.itos:
+                    tokens.append(tgt_vocab.itos[idx])
+            
+            message = ' '.join(tokens)
+            print(f"\033[96m  {i+1}. [{score:.4f}] {message}\033[0m", file=sys.stderr)
+    
+    # Return best sequence
+    if completed_beams:
+        # Convert sequences to text
+        candidate_texts = []
+        for seq, score in completed_beams[:10]:  # Consider top 10 candidates
+            tokens = []
+            for idx in seq[1:]:  # Skip SOS
+                if idx == eos_id:
+                    break
+                if idx in tgt_vocab.itos:
+                    tokens.append(tgt_vocab.itos[idx])
+            
+            message = ' '.join(tokens)
+            candidate_texts.append((message, score))
+        
+        # Apply MMR reranking if requested
+        if use_mmr and len(candidate_texts) > 1:
+            candidate_texts = mmr_rerank(candidate_texts, diff_text, mmr_lambda)
+        
+        best_message, best_score = candidate_texts[0]
+        return best_message
+    else:
+        return ""
+
+
 def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
                          max_seq_length, max_gen_length=100, beam_width=5, 
                          length_penalty=1.0, debug=True):
@@ -200,466 +473,196 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
     completed_beams = []
     
     with torch.no_grad():
-        for step in range(max_gen_length):
-            if debug and step < 3:
-                print(f"\n\033[94m📍 Step {step + 1}\033[0m", file=sys.stderr)
-                print(f"\033[96m   Active beams: {len(beams)}\033[0m", file=sys.stderr)
-            
-            candidates = []
-            
-            for beam_seq, beam_score in beams:
-                # Prepare input
-                current_tgt = beam_seq + [pad_id] * (max_seq_length - len(beam_seq))
-                tgt_tensor = torch.tensor([current_tgt[:max_seq_length]], dtype=torch.long).to(device)
+        # Get encoder output once
+        src_mask, _ = model.generate_mask(src_tensor, src_tensor)
+        src_embedded = model.dropout(model.encoder_embedding(src_tensor))
+        enc_output = src_embedded
+        for enc_layer in model.encoder_layers:
+            enc_output = enc_layer(enc_output, src_mask)
+    
+    for gen_step in range(max_gen_length):
+        candidates = []
+        
+        with torch.no_grad():
+            for seq, score in beams:
+                # Prepare decoder input
+                tgt_tensor = torch.tensor([seq], dtype=torch.long).to(device)
+                
+                # Create target mask
+                _, tgt_mask = model.generate_mask(src_tensor, tgt_tensor)
                 
                 # Forward pass
-                output = model(src_tensor, tgt_tensor)
-                logits = output[0, len(beam_seq) - 1, :]
+                tgt_embedded = model.dropout(model.decoder_embedding(tgt_tensor))
+                dec_output = tgt_embedded
+                for dec_layer in model.decoder_layers:
+                    dec_output = dec_layer(dec_output, enc_output, src_mask, tgt_mask)
+                
+                # Get logits for last position
+                logits = model.fc(dec_output[:, -1, :])
+                
+                # Convert to log probabilities
                 log_probs = torch.log_softmax(logits, dim=-1)
                 
                 # Get top-k candidates
-                topk_log_probs, topk_indices = torch.topk(log_probs, beam_width)
+                top_k_probs, top_k_indices = torch.topk(log_probs, beam_width)
                 
-                for log_prob, token_id in zip(topk_log_probs.tolist(), topk_indices.tolist()):
-                    new_seq = beam_seq + [token_id]
-                    new_score = beam_score + log_prob
+                for i in range(beam_width):
+                    token_id = top_k_indices[0, i].item()
+                    token_score = top_k_probs[0, i].item()
                     
-                    # Apply length penalty: score / (length ** length_penalty)
-                    normalized_score = new_score / (len(new_seq) ** length_penalty)
+                    new_seq = seq + [token_id]
+                    new_score = score + token_score
                     
-                    # Check if completed
-                    if token_id == eos_id or token_id == pad_id:
-                        completed_beams.append((new_seq, normalized_score))
-                    else:
-                        candidates.append((new_seq, new_score, normalized_score))
+                    # Apply length penalty
+                    if length_penalty > 0:
+                        new_score = new_score / (len(new_seq) ** length_penalty)
+                    
+                    candidates.append((new_seq, new_score))
+        
+        # Sort candidates by score
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Select top beams
+        beams = []
+        for seq, score in candidates:
+            if seq[-1] == eos_id:
+                completed_beams.append((seq, score))
+            else:
+                beams.append((seq, score))
             
-            if not candidates:
+            if len(beams) == beam_width:
                 break
-            
-            # Sort by normalized score and keep top beam_width
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            beams = [(seq, score) for seq, score, _ in candidates[:beam_width]]
-            
-            if debug and step < 3:
-                print(f"\033[95m   Top 3 beam sequences:\033[0m", file=sys.stderr)
-                for i, (seq, score) in enumerate(beams[:3], 1):
-                    text = decode_ids(seq[1:], tgt_vocab)  # Skip SOS
-                    print(f"\033[95m   {i}. Score={score:.2f} '{text}'\033[0m", file=sys.stderr)
-            
-            # Early stopping if we have enough completed beams
-            if len(completed_beams) >= beam_width:
-                break
-    
-    # Add remaining beams to completed
-    for seq, score in beams:
-        normalized_score = score / (len(seq) ** length_penalty)
-        completed_beams.append((seq, normalized_score))
-    
-    if not completed_beams:
-        if debug:
-            print(f"\033[93m⚠️  No completed beams, returning empty\033[0m", file=sys.stderr)
-        return ""
-    
-    # Select best beam
-    best_beam = max(completed_beams, key=lambda x: x[1])
-    best_seq = best_beam[0]
-    
-    if debug:
-        print(f"\n\033[92m✅ Best beam selected:\033[0m", file=sys.stderr)
-        print(f"\033[96m   Score: {best_beam[1]:.4f}\033[0m", file=sys.stderr)
-        print(f"\033[96m   Length: {len(best_seq)}\033[0m", file=sys.stderr)
-    
-    # Decode (skip SOS)
-    message = decode_ids(best_seq[1:], tgt_vocab)
-    
-    if debug:
-        print(f"\033[92m   Message: '{message}'\033[0m", file=sys.stderr)
-        print(f"\033[96m{'='*70}\033[0m", file=sys.stderr)
-    
-    return message
-
-
-def decode_ids(ids, vocab):
-    """Convert token IDs back to text."""
-    tokens = []
-    for token_id in ids:
-        token = vocab.itos.get(int(token_id), '<UNK>')
-        # Stop at special tokens
-        if token in ['<EOS>', '<PAD>']:
+        
+        # If all beams are complete, stop
+        if len(beams) == 0:
             break
-        if token not in ['<SOS>', '<UNK>']:
-            tokens.append(token)
     
-    return "".join(tokens).strip()
-
-
-def generate_commit_message(model, diff_text, src_vocab, tgt_vocab, device, 
-                           max_seq_length, max_gen_length=100, debug=False, interactive=False,
-                           use_sampling=False, temperature=1.0, top_p=0.9, top_k=50):
-    """
-    Generate a commit message from diff text with sampling support.
+    # Add any remaining beams to completed
+    completed_beams.extend(beams)
     
-    Args:
-        model: Trained transformer model
-        diff_text: Source diff text
-        src_vocab: Source vocabulary
-        tgt_vocab: Target vocabulary
-        device: torch device
-        max_seq_length: Maximum sequence length for model
-        max_gen_length: Maximum length of generated message
-        debug: Print debug information
-        interactive: Wait for Enter key after each step
-        use_sampling: Use sampling instead of greedy decoding
-        temperature: Temperature for sampling (higher = more random)
-        top_p: Nucleus sampling parameter (0.0-1.0)
-        top_k: Top-k sampling parameter (0 = disabled)
-    
-    Returns:
-        Generated commit message string
-    """
-    # Tokenize source
-    src_ids = tokenize_and_pad(diff_text, src_vocab, max_seq_length)
-    src_tensor = torch.tensor([src_ids], dtype=torch.long).to(device)
-    
-    # Initialize generation
-    sos_id = tgt_vocab.stoi["<SOS>"]
-    eos_id = tgt_vocab.stoi["<EOS>"]
-    pad_id = tgt_vocab.stoi["<PAD>"]
+    # Sort completed beams by score
+    completed_beams.sort(key=lambda x: x[1], reverse=True)
     
     if debug:
-        print(f"\n\033[96m{'='*70}\033[0m", file=sys.stderr)
-        print(f"\033[96m🔍 DEBUG MODE - Generation Step by Step\033[0m", file=sys.stderr)
-        print(f"\033[96m{'='*70}\033[0m", file=sys.stderr)
-        print(f"\033[93m[INFO] Special tokens: SOS={sos_id}, EOS={eos_id}, PAD={pad_id}\033[0m", file=sys.stderr)
-        print(f"\033[93m[INFO] Decoding: {'Sampling' if use_sampling else 'Greedy'}\033[0m", file=sys.stderr)
-        if use_sampling:
-            print(f"\033[93m[INFO] Temperature={temperature}, top_p={top_p}, top_k={top_k}\033[0m", file=sys.stderr)
-        if interactive:
-            print(f"\033[95m[INTERACTIVE] Press ENTER to proceed to next step...\033[0m", file=sys.stderr)
+        print(f"\n\033[96mTop {min(3, len(completed_beams))} candidates:\033[0m", file=sys.stderr)
+        for i, (seq, score) in enumerate(completed_beams[:3]):
+            # Convert to text
+            tokens = []
+            for idx in seq[1:]:  # Skip SOS
+                if idx == eos_id:
+                    break
+                if idx in tgt_vocab.itos:
+                    tokens.append(tgt_vocab.itos[idx])
+            
+            message = ' '.join(tokens)
+            print(f"\033[96m  {i+1}. [{score:.4f}] {message}\033[0m", file=sys.stderr)
     
-    tgt_ids = [sos_id]
-    generated = []
-    generated_text_so_far = ""
-    
-    with torch.no_grad():
-        for step in range(max_gen_length):
-            # Prepare target input
-            current_tgt = tgt_ids + [pad_id] * (max_seq_length - len(tgt_ids))
-            tgt_tensor = torch.tensor([current_tgt[:max_seq_length]], dtype=torch.long).to(device)
-            
-            if debug:
-                print(f"\n\033[94m{'─'*70}\033[0m", file=sys.stderr)
-                print(f"\033[94m📍 Step {step + 1}/{max_gen_length}\033[0m", file=sys.stderr)
-                print(f"\033[96m   Current position: {len(tgt_ids) - 1}\033[0m", file=sys.stderr)
-                print(f"\033[96m   Tokens generated so far: {len(generated)}\033[0m", file=sys.stderr)
-                if generated_text_so_far:
-                    print(f"\033[92m   Message so far: '{generated_text_so_far}'\033[0m", file=sys.stderr)
-            
-            # Forward pass
-            if debug:
-                print(f"\033[93m   🔄 Running forward pass...\033[0m", file=sys.stderr)
-            
-            output = model(src_tensor, tgt_tensor)
-            
-            # Get prediction for next token
-            logits = output[0, len(tgt_ids) - 1, :]
-            
-            # Apply temperature scaling
-            if use_sampling and temperature != 1.0:
-                logits = logits / temperature
-            
-            # Get probabilities
-            probs = torch.softmax(logits, dim=-1)
-            
-            if debug:
-                # Show top 5 predictions
-                topk_probs, topk_indices = torch.topk(probs, 5)
-                
-                print(f"\033[95m   📊 Top 5 Predictions:\033[0m", file=sys.stderr)
-                print(f"\033[95m   {'Rank':<6} {'Token ID':<10} {'Token':<20} {'Probability':<12}\033[0m", file=sys.stderr)
-                print(f"\033[95m   {'-'*50}\033[0m", file=sys.stderr)
-                
-                for i, (prob, token_id) in enumerate(zip(topk_probs.tolist(), topk_indices.tolist()), 1):
-                    token = tgt_vocab.itos.get(token_id, '<UNK>')
-                    
-                    # Format token for display
-                    if token in ['<PAD>', '<EOS>', '<SOS>', '<UNK>']:
-                        token_display = f"\033[91m{token}\033[0m"  # Red for special tokens
-                    else:
-                        token_display = repr(token) if len(token) <= 15 else repr(token[:15] + "...")
-                    
-                    print(f"\033[95m   {i:<6} {token_id:<10} {token_display:<28} {prob:.6f}\033[0m", file=sys.stderr)
-            
-            # Select next token based on decoding strategy
-            if use_sampling:
-                # Apply top-k filtering
-                if top_k > 0:
-                    top_k_probs, top_k_indices = torch.topk(probs, min(top_k, probs.size(-1)))
-                    # Zero out probabilities outside top-k
-                    probs_filtered = torch.zeros_like(probs)
-                    probs_filtered.scatter_(0, top_k_indices, top_k_probs)
-                    probs = probs_filtered
-                
-                # Apply nucleus (top-p) filtering
-                if top_p < 1.0:
-                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                    cumsum_probs = torch.cumsum(sorted_probs, dim=0)
-                    
-                    # Find cutoff index where cumsum exceeds top_p
-                    sorted_indices_to_remove = cumsum_probs > top_p
-                    # Keep at least one token
-                    sorted_indices_to_remove[0] = False
-                    
-                    # Zero out removed tokens
-                    probs_filtered = probs.clone()
-                    indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                    probs_filtered[indices_to_remove] = 0
-                    probs = probs_filtered
-                
-                # Renormalize
-                probs = probs / probs.sum()
-                
-                # Sample from distribution
-                next_token = torch.multinomial(probs, 1).item()
-                
-                if debug:
-                    print(f"\033[93m   🎲 Sampled token (not argmax)\033[0m", file=sys.stderr)
-            else:
-                # Greedy decoding
-                next_token = torch.argmax(probs).item()
-            
-            next_token_str = tgt_vocab.itos.get(next_token, '<UNK>')
-            
-            if debug:
-                print(f"\n\033[92m   ✓ Selected token: ID={next_token} Token={repr(next_token_str)}\033[0m", file=sys.stderr)
-            
-            # Stop conditions
-            if next_token == eos_id:
-                if debug:
-                    print(f"\033[93m   🛑 Hit <EOS> token - stopping generation\033[0m", file=sys.stderr)
+    # Return best sequence
+    if completed_beams:
+        best_seq, best_score = completed_beams[0]
+        # Convert to text
+        tokens = []
+        for idx in best_seq[1:]:  # Skip SOS
+            if idx == eos_id:
                 break
-            
-            if next_token == pad_id:
-                if debug:
-                    print(f"\033[93m   🛑 Hit <PAD> token - stopping generation\033[0m", file=sys.stderr)
-                break
-            
-            # Check for repetition (stuck in loop)
-            if len(generated) >= 5 and all(t == next_token for t in generated[-5:]):
-                if debug:
-                    print(f"\033[93m   🛑 Stuck in repetition (same token 5 times) - stopping\033[0m", file=sys.stderr)
-                break
-            
-            tgt_ids.append(next_token)
-            generated.append(next_token)
-            
-            # Update generated text so far
-            generated_text_so_far = decode_ids(generated, tgt_vocab)
-            
-            # Interactive mode - wait for user input
-            if interactive and debug:
-                print(f"\n\033[95m   Press ENTER to continue to next step (or Ctrl+C to skip)...\033[0m", file=sys.stderr)
-                try:
-                    input()
-                except KeyboardInterrupt:
-                    print(f"\n\033[93m   ⏭️  Skipping interactive mode for remaining steps\033[0m", file=sys.stderr)
-                    interactive = False  # Disable for rest of generation
-    
-    if debug:
-        print(f"\n\033[96m{'='*70}\033[0m", file=sys.stderr)
-        print(f"\033[92m✅ Generation Complete!\033[0m", file=sys.stderr)
-        print(f"\033[96m   Total tokens generated: {len(generated)}\033[0m", file=sys.stderr)
-        print(f"\033[96m   Token IDs: {generated[:30]}{'...' if len(generated) > 30 else ''}\033[0m", file=sys.stderr)
-    
-    # Decode to text
-    message = decode_ids(generated, tgt_vocab)
-    
-    if debug:
-        print(f"\033[92m   Final decoded message: '{message}'\033[0m", file=sys.stderr)
-        print(f"\033[96m{'='*70}\033[0m", file=sys.stderr)
-    
-    return message
+            if idx in tgt_vocab.itos:
+                tokens.append(tgt_vocab.itos[idx])
+        
+        return ' '.join(tokens)
+    else:
+        return ""
 
 
-def evaluate(args):
-    """Main evaluation function."""
-    
-    print_header("🚀 Commit Message Generation Evaluation")
-    
-    # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print_info(f"Device: {device}")
-    if torch.cuda.is_available():
-        print_info(f"GPU: {torch.cuda.get_device_name(0)}")
-    
-    # Load vocabularies
-    src_vocab, tgt_vocab = load_vocabularies(args.diff_vocab, args.message_vocab)
-    
-    # Load model
-    model = load_model(
-        args.checkpoint,
-        len(src_vocab.stoi),
-        len(tgt_vocab.stoi),
-        device,
-        args
-    )
-    
-    # Load test data
-    print_step("Loading test data...")
-    df = pd.read_parquet(args.test_data)
-    df['diff_text'] = df['diff_text'].fillna('')
-    df['message'] = df['message'].fillna('')
-    
-    print_info(f"Total samples: {len(df):,}")
-    
-    if args.num_samples:
-        df = df.head(args.num_samples)
-        print_warning(f"Evaluating on first {args.num_samples:,} samples only")
-    
-    print_success("Test data loaded")
-    
-    # Generate predictions
-    print_header("📝 Generating Commit Messages")
-    
-    results = []
-    
-    with tqdm(total=len(df), desc="Generating", file=sys.stderr) as pbar:
-        for idx, row in df.iterrows():
-            diff_text = row.get('diff_text', '')
-            original_message = row.get('message', '')
-            
-            # Handle empty diffs
-            if not diff_text or pd.isna(diff_text):
-                generated_message = ""
-            else:
-                try:
-                    generated_message = generate_commit_message(
-                        model, 
-                        str(diff_text),
-                        src_vocab,
-                        tgt_vocab,
-                        device,
-                        args.max_seq_length,
-                        max_gen_length=args.max_gen_length
-                    )
-                except Exception as e:
-                    print_error(f"Error at row {idx}: {e}")
-                    generated_message = "<ERROR>"
-            
-            # Store result
-            results.append({
-                'index': idx,
-                'original_message': original_message,
-                'generated_message': generated_message,
-                'diff_text_preview': str(diff_text)[:200] + "..." if len(str(diff_text)) > 200 else str(diff_text)
-            })
-            
-            pbar.update(1)
-            
-            # Show progress every 100 samples
-            if (idx + 1) % 100 == 0:
-                pbar.set_postfix({'processed': f"{idx + 1}/{len(df)}"})
-    
-    # Create results dataframe
-    results_df = pd.DataFrame(results)
-    
-    # Save results
-    print_header("💾 Saving Results")
-    
-    print_step("Saving CSV file...")
-    results_df.to_csv(args.output, index=False)
-    print_success(f"Saved to: {args.output}")
-    print_info(f"Total rows: {len(results_df):,}")
-    
-    # Show sample results
-    print_header("📊 Sample Results")
-    
-    print_info("First 5 predictions:")
-    for i in range(min(5, len(results_df))):
-        row = results_df.iloc[i]
-        print(f"\n  \033[96mSample {i+1}:\033[0m", file=sys.stderr)
-        print(f"  \033[93mOriginal:\033[0m {row['original_message']}", file=sys.stderr)
-        print(f"  \033[92mGenerated:\033[0m {row['generated_message']}", file=sys.stderr)
-    
-    # Summary statistics
-    print_header("📈 Summary Statistics")
-    
-    # Count empty generations
-    empty_count = sum(1 for msg in results_df['generated_message'] if not msg or msg == "<ERROR>")
-    print_info(f"Total samples: {len(results_df):,}")
-    print_info(f"Successful generations: {len(results_df) - empty_count:,}")
-    if empty_count > 0:
-        print_warning(f"Empty/Error generations: {empty_count:,}")
-    
-    # Average lengths
-    orig_lengths = [len(str(msg)) for msg in results_df['original_message'] if msg]
-    gen_lengths = [len(str(msg)) for msg in results_df['generated_message'] if msg and msg != "<ERROR>"]
-    
-    if orig_lengths:
-        print_info(f"Avg original message length: {sum(orig_lengths)/len(orig_lengths):.1f} chars")
-    if gen_lengths:
-        print_info(f"Avg generated message length: {sum(gen_lengths)/len(gen_lengths):.1f} chars")
-    
-    print_header("✅ Evaluation Complete!")
-    print_info(f"Results saved to: {args.output}")
-    
-    return results_df
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate transformer model and generate commit messages",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    # Required arguments
-    parser.add_argument("--test-data", required=True, 
-                       help="Path to test parquet file")
-    parser.add_argument("--checkpoint", required=True,
-                       help="Path to model checkpoint (.pth file)")
-    
-    # Vocabulary paths
-    parser.add_argument("--diff-vocab", default="./tokenizer/diff_vocab.pkl",
-                       help="Path to diff vocabulary")
-    parser.add_argument("--message-vocab", default="./tokenizer/message_vocab.pkl",
-                       help="Path to message vocabulary")
-    
-    # Output
-    parser.add_argument("--output", default="./predictions.csv",
-                       help="Output CSV file path")
-    
-    # Sampling
-    parser.add_argument("--num-samples", type=int, default=None,
-                       help="Number of samples to evaluate (None = all)")
-    
-    # Generation parameters
-    parser.add_argument("--max-gen-length", type=int, default=100,
-                       help="Maximum length of generated message")
-    
-    # Model hyperparameters (must match training config)
-    parser.add_argument("--d-model", type=int, default=1024,
-                       help="Model dimension")
-    parser.add_argument("--num-heads", type=int, default=8,
-                       help="Number of attention heads")
-    parser.add_argument("--num-layers", type=int, default=4,
-                       help="Number of transformer layers")
-    parser.add_argument("--d-ff", type=int, default=2048,
-                       help="Feed-forward dimension")
-    parser.add_argument("--max-seq-length", type=int, default=256,
-                       help="Maximum sequence length")
-    parser.add_argument("--dropout", type=float, default=0.3,
-                       help="Dropout rate")
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate Transformer model for commit message generation")
+    parser.add_argument("--data-path", default="./val_data.parquet", help="Path to parquet file")
+    parser.add_argument("--diff-vocab-path", default="./tokenizer/diff_vocab.pkl", help="Path to diff vocabulary")
+    parser.add_argument("--message-vocab-path", default="./tokenizer/message_vocab.pkl", help="Path to message vocabulary")
+    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
+    parser.add_argument("--output", default="predictions.csv", help="Output CSV file path")
+    parser.add_argument("--max-seq-length", type=int, default=256, help="Maximum sequence length")
+    parser.add_argument("--max-gen-length", type=int, default=50, help="Maximum generation length")
+    parser.add_argument("--beam-width", type=int, default=5, help="Beam search width")
+    parser.add_argument("--length-penalty", type=float, default=1.0, help="Length penalty factor")
+    parser.add_argument("--use-mmr", action="store_true", help="Use Maximum Marginal Relevance reranking")
+    parser.add_argument("--mmr-lambda", type=float, default=0.7, help="MMR trade-off parameter (0=diverse, 1=relevant)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.2, help="Repetition penalty factor")
+    parser.add_argument("--ngram-size", type=int, default=2, help="N-gram size for repetition penalty")
+    parser.add_argument("--d-model", type=int, default=1024, help="Model dimension")
+    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--num-layers", type=int, default=4, help="Number of transformer layers")
+    parser.add_argument("--d-ff", type=int, default=2048, help="Feed-forward dimension")
+    parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
     
     args = parser.parse_args()
     
-    # Run evaluation
-    try:
-        results = evaluate(args)
-    except KeyboardInterrupt:
-        print_warning("\nEvaluation interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        print_error(f"Evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    print_header("COMMIT MESSAGE GENERATION EVALUATION")
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print_info(f"Device: {device}")
+    
+    # Load data
+    print_step("Loading data...")
+    df = pd.read_parquet(args.data_path)
+    df = df.sample(frac=0.0002, random_state=42) # random_state for reproducibility
+    print_info(f"Loaded {len(df):,} samples")
+    print_success("Data loaded")
+    
+    # Load vocabularies
+    src_vocab, tgt_vocab = load_vocabularies(args.diff_vocab_path, args.message_vocab_path)
+    src_vocab_size = len(src_vocab.stoi)
+    tgt_vocab_size = len(tgt_vocab.stoi)
+    
+    # Load model
+    model = load_model(args.checkpoint, src_vocab_size, tgt_vocab_size, device, args)
+    
+    # Generate predictions
+    print_step("Generating predictions...")
+    predictions = []
+    
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Generating"):
+        diff_text = row['diff_text'] if not pd.isna(row['diff_text']) else ""
+        
+        try:
+            if args.use_mmr or args.repetition_penalty != 1.0:
+                pred = diversity_beam_search_generate(
+                    model, diff_text, src_vocab, tgt_vocab, device,
+                    args.max_seq_length, args.max_gen_length, args.beam_width,
+                    args.length_penalty, args.repetition_penalty, args.ngram_size,
+                    args.use_mmr, args.mmr_lambda, debug=False
+                )
+            else:
+                pred = beam_search_generate(
+                    model, diff_text, src_vocab, tgt_vocab, device,
+                    args.max_seq_length, args.max_gen_length, args.beam_width,
+                    args.length_penalty, debug=False
+                )
+            
+            predictions.append(pred)
+        except Exception as e:
+            print_warning(f"Error generating for row {idx}: {e}")
+            predictions.append("")
+
+    # Add predictions to dataframe
+    df['predicted_message'] = predictions
+    
+    # Save to CSV
+    print_step("Saving predictions...")
+    df.to_csv(args.output, index=False)
+    print_success(f"Predictions saved to {args.output}")
+    
+    # Print sample predictions
+    print_step("Sample predictions:")
+    for i in range(min(5, len(df))):
+        actual = df.iloc[i]['message'] if not pd.isna(df.iloc[i]['message']) else ""
+        predicted = df.iloc[i]['predicted_message']
+        print(f"  Actual:    {actual}")
+        print(f"  Predicted: {predicted}")
+        print()
+
+    print_header("EVALUATION COMPLETE")
+
+
+if __name__ == "__main__":
+    main()

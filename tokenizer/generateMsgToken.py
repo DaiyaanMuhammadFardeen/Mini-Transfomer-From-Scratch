@@ -3,6 +3,7 @@ import pickle
 import json
 import random
 from MsgVocabulary import MsgVocabulary
+from visualization import generate_comprehensive_report
 
 
 def load_data(file_path):
@@ -33,6 +34,14 @@ def main():
         json.dump(tokenized_samples, f, ensure_ascii=False, indent=4)
 
     print("✅ Message vocabulary saved! Tokenized samples exported to JSON.")
+    
+    # Generate visualizations for the message vocabulary
+    print("Generating visualizations for message vocabulary...")
+    sample_texts = ["Fix critical security vulnerability in auth module with JWT implementation",
+                    "Add new feature for user authentication using React and Node.js",
+                    "Refactor data processing module for better performance with caching"]
+    generate_comprehensive_report(vocab, "MsgVocabulary", vocab, "MsgVocabulary", sample_texts)
+    print("✅ Visualizations generated for message vocabulary!")
 
 if __name__ == "__main__":
     main()
