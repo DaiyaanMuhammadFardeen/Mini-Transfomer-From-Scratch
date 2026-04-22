@@ -44,7 +44,7 @@ def main():
         file_path, 
         'diff_text', 
         temp_vocab.tokenize,
-        chunk_size=5000
+        chunk_size=50000
     )
     
     print(f"Collected {len(word_freqs)} unique tokens")

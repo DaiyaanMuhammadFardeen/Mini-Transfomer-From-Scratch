@@ -14,7 +14,10 @@ from functools import partial
 import json
 
 # Import programming terms
-from programming_terms import extract_programming_terms, create_programming_tokens
+try:
+    from tokenizer.programming_terms import extract_programming_terms, create_programming_tokens
+except ImportError:
+    from programming_terms import extract_programming_terms, create_programming_tokens
 
 
 class MsgVocabulary:

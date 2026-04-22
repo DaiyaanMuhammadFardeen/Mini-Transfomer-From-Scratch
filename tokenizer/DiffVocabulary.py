@@ -19,7 +19,10 @@ import numpy as np
 from typing import Dict, List, Set, Tuple, Optional, Any
 
 # Import programming terms
-from programming_terms import extract_programming_terms, create_programming_tokens
+try:
+    from tokenizer.programming_terms import extract_programming_terms, create_programming_tokens
+except ImportError:
+    from programming_terms import extract_programming_terms, create_programming_tokens
 
 
 class DiffVocabulary:
@@ -104,16 +107,37 @@ class DiffVocabulary:
         
         # Parser for tree-sitter
         self._parser = None
+        self._parser_init_failed = False  # Track if parser initialization failed
+        self._parse_warning_count = 0  # Limit warning spam
+    
+    def __getstate__(self):
+        """Custom pickle state - exclude parser since it can't be pickled."""
+        state = self.__dict__.copy()
+        # Remove unpicklable entries
+        state['_parser'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """Restore state and reinitialize parser to None."""
+        self.__dict__.update(state)
+        # Ensure _parser exists and is None (will be lazily initialized)
+        if '_parser' not in self.__dict__:
+            self._parser = None
+        if '_parser_init_failed' not in self.__dict__:
+            self._parser_init_failed = False
+        if '_parse_warning_count' not in self.__dict__:
+            self._parse_warning_count = 0
 
     def _get_parser(self):
         """Lazy load tree-sitter parser with correct path resolution."""
-        if self._parser is None:
+        if self._parser is None and not self._parser_init_failed:
             current_file = os.path.abspath(__file__)
             current_dir = os.path.dirname(current_file)
             lib_path = os.path.join(current_dir, "build", "python.so")
 
             if not os.path.exists(lib_path):
                 print(f"[ERROR] Cannot find {lib_path}", file=sys.stderr)
+                self._parser_init_failed = True
                 raise FileNotFoundError(f"Cannot find tree-sitter library at {lib_path}")
 
             try:
@@ -124,6 +148,7 @@ class DiffVocabulary:
                 # print(f"[DEBUG] Tree-sitter parser loaded successfully from {lib_path}", file=sys.stderr)
             except Exception as e:
                 print(f"[ERROR] Failed to load tree-sitter: {e}", file=sys.stderr)
+                self._parser_init_failed = True
                 raise
 
         return self._parser
@@ -431,10 +456,14 @@ class DiffVocabulary:
                     tree = parser.parse(bytes(inner_code, "utf8"))
                     tokens.extend(self._extract_code_tokens(tree.root_node, bytes(inner_code, "utf8"), depth=0))
                 except UnicodeDecodeError as e:
-                    print(f"[WARNING] Invalid UTF-8 in diff line: {e}, falling back to simple split", file=sys.stderr)
                     tokens.extend(inner_code.split())
                 except Exception as e:
-                    print(f"[WARNING] Parsing error: {e}, falling back to simple split", file=sys.stderr)
+                    # Limit warning spam - only show first 10 warnings per instance
+                    if self._parse_warning_count < 10:
+                        print(f"[WARNING] Parsing error: {e}, falling back to simple split", file=sys.stderr)
+                        self._parse_warning_count += 1
+                        if self._parse_warning_count == 10:
+                            print(f"[INFO] Suppressing further parsing warnings for this process", file=sys.stderr)
                     tokens.extend(inner_code.split())
 
             if closing_tag:
@@ -1005,8 +1034,13 @@ class DiffVocabulary:
         print(f"✅ Multimodal vocabulary built! Total tokens: {len(self.stoi)}", file=sys.stderr)
 
     def _parallel_tokenize(self, args):
-        """Helper for parallel tokenization."""
+        """Helper for parallel tokenization - ensures parser is initialized in worker process."""
         instance, sentence = args
+        # Ensure parser is initialized in this worker process
+        try:
+            instance._get_parser()
+        except Exception as e:
+            print(f"[WARNING] Failed to initialize parser in worker: {e}", file=sys.stderr)
         return instance.tokenize(sentence)
 
     def _aggressive_prefilter(self, word_freqs):
