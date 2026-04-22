@@ -6,6 +6,7 @@ import pandas as pd
 import os
 import sys
 import argparse
+import csv
 from torch.utils.data import DataLoader, random_split
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
@@ -201,10 +202,15 @@ def load_checkpoint(checkpoint_path, transformer, optimizer, scheduler, scaler, 
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     print(f"\033[92m✓ Optimizer state loaded\033[0m", file=sys.stderr)
 
-    # Load scaler state if available
+    # Load scaler state if available (only for float16 mode)
     if 'scaler_state_dict' in checkpoint:
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         print(f"\033[92m✓ GradScaler state loaded\033[0m", file=sys.stderr)
+    
+    # Check if checkpoint was saved with bfloat16
+    use_bfloat16_ckpt = checkpoint.get('use_bfloat16', False)
+    if use_bfloat16_ckpt:
+        print("\033[93m⚠ Checkpoint was trained with bfloat16\033[0m", file=sys.stderr)
 
     # Get the epoch number
     start_epoch = checkpoint.get('epoch', 0)
@@ -272,9 +278,25 @@ def main(args):
     print(f"\033[92m✓ Dataset split: {train_size} train, {val_size} validation\033[0m", file=sys.stderr)
 
     print("\033[94m🔗 Creating DataLoaders\033[0m", file=sys.stderr)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=6)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=6)
-    print(f"\033[92m✓ DataLoaders created with batch_size: {batch_size}\033[0m", file=sys.stderr)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,         # 6 workers can bottleneck on 16GB RAM; 4 is safer
+        pin_memory=True,       # Faster CPU→GPU transfer
+        prefetch_factor=2,     # Prefetch next 2 batches while GPU works
+        persistent_workers=True # Don't restart workers each epoch
+    )
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
+    )
+    print(f"\033[92m✓ DataLoaders created with batch_size: {batch_size}, pin_memory=True\033[0m", file=sys.stderr)
 
     print("\033[94m🤖 Initializing Transformer model\033[0m", file=sys.stderr)
     transformer = Transformer(
@@ -290,17 +312,45 @@ def main(args):
     print(f"\033[92m✓ Transformer model initialized with {sum(p.numel() for p in transformer.parameters())} parameters\033[0m", file=sys.stderr)
 
     print("\033[94m📉 Initializing loss criterion\033[0m", file=sys.stderr)
-    criterion = nn.CrossEntropyLoss(ignore_index=tgt_vocab.stoi["<PAD>"], label_smoothing=0.05)
-    print(f"\033[92m✓ CrossEntropyLoss criterion created\033[0m", file=sys.stderr)
+    criterion = nn.CrossEntropyLoss(ignore_index=tgt_vocab.stoi["<PAD>"], label_smoothing=0.1)
+    print(f"\033[92m✓ CrossEntropyLoss criterion created (label_smoothing=0.1)\033[0m", file=sys.stderr)
 
     print("\033[94m🔄 Initializing optimizer and scheduler\033[0m", file=sys.stderr)
-    optimizer = optim.Adam(transformer.parameters(), lr=learning_rate, betas=(0.9, 0.98), eps=1e-9, weight_decay=0.0001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2)
-    print(f"\033[92m✓ Adam optimizer and ReduceLROnPlateau scheduler initialized\033[0m", file=sys.stderr)
+    
+    # Noam (transformer) learning rate schedule
+    def noam_schedule(step, d_model, warmup_steps=4000):
+        """Noam learning rate schedule from 'Attention Is All You Need'."""
+        step = max(1, step)
+        return (d_model ** -0.5) * min(step ** -0.5, step * warmup_steps ** -1.5)
+    
+    # Use AdamW with correct decoupled weight decay (Loshchilov & Hutter 2017)
+    optimizer = optim.AdamW(
+        transformer.parameters(),
+        lr=1e-4,  # Peak LR; warmup will scale this
+        betas=(0.9, 0.98),
+        eps=1e-9,
+        weight_decay=0.01  # Standard for transformers
+    )
+    
+    # LambdaLR scheduler with Noam schedule - steps every batch
+    global_step = 0
+    scheduler = optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: noam_schedule(step, d_model=d_model, warmup_steps=4000)
+    )
+    
+    print(f"\033[92m✓ AdamW optimizer and Noam scheduler initialized\033[0m", file=sys.stderr)
 
-    print("\033[94m🎛️  Initializing GradScaler\033[0m", file=sys.stderr)
-    scaler = GradScaler("cuda")
-    print(f"\033[92m✓ GradScaler initialized for CUDA\033[0m", file=sys.stderr)
+    print("\033[94m🎛️  Initializing mixed precision\033[0m", file=sys.stderr)
+    # Use bfloat16 if supported (ROCm 5.2+), fallback to float16 with GradScaler
+    use_bfloat16 = torch.cuda.is_bf16_supported() if device.type == 'cuda' else False
+    if use_bfloat16:
+        print("\033[92m✓ Using bfloat16 mixed precision (no GradScaler needed)\033[0m", file=sys.stderr)
+        scaler = None
+    else:
+        print("\033[93m⚠ bfloat16 not supported, using float16 with GradScaler\033[0m", file=sys.stderr)
+        scaler = GradScaler("cuda")
+        print(f"\033[92m✓ GradScaler initialized for CUDA\033[0m", file=sys.stderr)
 
     print("\033[94m🎓 Setting model to training mode\033[0m", file=sys.stderr)
     transformer.train()
@@ -325,6 +375,12 @@ def main(args):
         print(f"\033[95m🔥 Resuming training from epoch {start_epoch + 1}\033[0m", file=sys.stderr)
     else:
         print("\033[95m🔥 Starting training from scratch\033[0m", file=sys.stderr)
+    
+    # Initialize CSV logging
+    log_path = os.path.join(args.checkpoint_dir, "training_log.csv")
+    with open(log_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch', 'step', 'train_loss', 'val_loss', 'lr', 'gpu_mem_mb'])
 
     for epoch in range(start_epoch, num_epochs):
         print(f"\n\033[95m{'='*60}\033[0m", file=sys.stderr)
@@ -333,61 +389,69 @@ def main(args):
         total_train_loss = 0
 
         print(f"\033[96m▶️  Starting train batch iteration for epoch {epoch+1}\033[0m", file=sys.stderr)
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1} Train", position=1, leave=False)
-        for batch_idx, (src_data, tgt_data) in enumerate(pbar):
-            src_data, tgt_data = src_data.to(device), tgt_data.to(device)
+        pbar = tqdm(train_dataloader, 
+                    desc=f"Epoch {epoch+1}/{num_epochs} Train", 
+                    position=0, 
+                    leave=True,
+                    unit="batch",
+                    dynamic_ncols=True)
+        for batch_idx, batch_data in enumerate(pbar):
+            # Unpack batch data - now includes change_features
+            if len(batch_data) == 3:
+                src_data, tgt_data, change_features = batch_data
+            else:
+                # Backward compatibility with old 2-tuple format
+                src_data, tgt_data = batch_data
+                change_features = None
+            
+            src_data = src_data.to(device)
+            tgt_data = tgt_data.to(device)
+            if change_features is not None:
+                change_features = change_features.to(device)
+            
             optimizer.zero_grad()
 
-            with autocast("cuda" if device.type == 'cuda' else "cpu"):
-                # For now, call the model without additional features (backward compatibility)
-                # In a full implementation, we would extract and pass multimodal features
-                output = transformer(src_data, tgt_data[:, :-1])
-
-                # Cross-entropy loss
-                ce_loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
-
-                # Length regularization loss
-                len_loss = length_regularization_loss(output, tgt_data, tgt_vocab.stoi["<EOS>"], min_length=5, lambda_len=0.01)
-
-                # Contrastive loss - use encoder output as embeddings
-                with torch.no_grad():
-                    # Get encoder representations for contrastive loss
-                    src_mask, _ = transformer.generate_mask(src_data, tgt_data[:, :-1])
-                    # Use the model's embedding method if available, otherwise use basic embedding
-                    try:
-                        src_embedded = transformer.encoder_embedding(src_data, None)  # Pass None for features
-                    except:
-                        # Fallback to basic embedding if multimodal embedding fails
-                        src_embedded = transformer.dropout(transformer.encoder_embedding.token_embedding(src_data))
-                    
-                    enc_output = src_embedded
-                    for enc_layer in transformer.encoder_layers:
-                        enc_output = checkpoint(
-                            enc_layer,
-                            enc_output,
-                            src_mask,
-                            preserve_rng_state=True,
-                            use_reentrant=False
-                        )
-
-                    # Use mean pooled encoder output as embeddings
-                    embeddings = enc_output.mean(dim=1)  # (batch_size, d_model)
-
-                # Compute contrastive loss
-                # cont_loss = contrastive_loss(embeddings, tgt_data[:, 1], temperature) if contrastive_weight > 0 else 0
-
-                # Compute diversity loss
-                div_loss = diversity_loss(output, tgt_data[:, 1:], tgt_vocab_size, diversity_weight) if diversity_weight > 0 else 0
-
-                # Combined loss
-                loss = ce_loss + len_loss + div_loss  # Removed contrastive_weight which was a constant
-                loss = torch.clamp(loss, min=-1e6, max=1e6)  # Adjust bounds as needed
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            # Training loop with ROCm/HIP Flash Attention context
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                if use_bfloat16:
+                    # bfloat16 - no GradScaler needed
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        output = transformer(src_data, tgt_data[:, :-1], change_features)
+                        ce_loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+                        len_loss = length_regularization_loss(output, tgt_data, tgt_vocab.stoi["<EOS>"], min_length=5, lambda_len=0.01)
+                        loss = ce_loss + len_loss
+                        loss = torch.clamp(loss, min=-1e6, max=1e6)
+                    loss.backward()
+                else:
+                    # float16 - use GradScaler
+                    with autocast("cuda" if device.type == 'cuda' else "cpu"):
+                        output = transformer(src_data, tgt_data[:, :-1], change_features)
+                        ce_loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+                        len_loss = length_regularization_loss(output, tgt_data, tgt_vocab.stoi["<EOS>"], min_length=5, lambda_len=0.01)
+                        loss = ce_loss + len_loss
+                        loss = torch.clamp(loss, min=-1e6, max=1e6)
+                    scaler.scale(loss).backward()
+            
+            # Gradient clipping (prevents exploding gradients)
+            if use_bfloat16:
+                torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
+                optimizer.step()
+            else:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            scheduler.step()  # Noam schedule steps every batch
+            global_step += 1
             total_train_loss += loss.item()
             current_avg_loss = total_train_loss / (batch_idx + 1)
             pbar.set_postfix({'batch_loss': f'{loss.item():.4f}', 'avg_loss': f'{current_avg_loss:.4f}'})
+            
+            # Log training metrics to CSV
+            gpu_mem = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+            with open(log_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([epoch+1, global_step, loss.item(), '', optimizer.param_groups[0]['lr'], gpu_mem])
 
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"\033[92m✓ Epoch {epoch+1}: Train loss: {avg_train_loss:.4f}\033[0m", file=sys.stderr)
@@ -397,43 +461,79 @@ def main(args):
         total_val_loss = 0
         print(f"\033[96m▶️  Starting validation batch iteration for epoch {epoch+1}\033[0m", file=sys.stderr)
         with torch.no_grad():
-            pbar = tqdm(val_dataloader, desc=f"Epoch {epoch+1} Val", position=1, leave=False)
-            for src_data, tgt_data in pbar:
-                src_data, tgt_data = src_data.to(device), tgt_data.to(device)
-                with autocast("cuda"):
-                    # For validation, call the model without additional features (backward compatibility)
-                    output = transformer(src_data, tgt_data[:, :-1])
-                    loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+            pbar = tqdm(val_dataloader, 
+                        desc=f"Epoch {epoch+1}/{num_epochs} Val", 
+                        position=0, 
+                        leave=True,
+                        unit="batch",
+                        dynamic_ncols=True)
+            for batch_data in pbar:
+                # Unpack batch data - now includes change_features
+                if len(batch_data) == 3:
+                    src_data, tgt_data, change_features = batch_data
+                else:
+                    # Backward compatibility with old 2-tuple format
+                    src_data, tgt_data = batch_data
+                    change_features = None
+                
+                src_data = src_data.to(device)
+                tgt_data = tgt_data.to(device)
+                if change_features is not None:
+                    change_features = change_features.to(device)
+                
+                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                    if use_bfloat16:
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            output = transformer(src_data, tgt_data[:, :-1], change_features)
+                            loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+                    else:
+                        with autocast("cuda"):
+                            output = transformer(src_data, tgt_data[:, :-1], change_features)
+                            loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
                 total_val_loss += loss.item()
                 pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
 
         avg_val_loss = total_val_loss / len(val_dataloader)
         print(f"\033[92m✓ Epoch {epoch+1}: Validation loss: {avg_val_loss:.4f}\033[0m", file=sys.stderr)
-        scheduler.step(avg_val_loss)
+        # Noam scheduler doesn't need epoch-level stepping
+        
+        # Update validation loss in CSV log (update last row for this epoch)
+        import pandas as pd
+        df_log = pd.read_csv(log_path)
+        epoch_mask = df_log['epoch'] == epoch + 1
+        if epoch_mask.any():
+            df_log.loc[epoch_mask, 'val_loss'] = avg_val_loss
+            df_log.to_csv(log_path, index=False)
 
         # Save checkpoint if validation loss improves
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             checkpoint_path = os.path.join(args.checkpoint_dir, f"transformer_best.pth")
             print(f"\033[96m💿 Saving best checkpoint to {checkpoint_path}\033[0m", file=sys.stderr)
-            torch.save({
+            checkpoint_dict = {
                 'epoch': epoch + 1,
                 'model_state_dict': transformer.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'val_loss': avg_val_loss
-            }, checkpoint_path)
+                'val_loss': avg_val_loss,
+                'use_bfloat16': use_bfloat16
+            }
+            if scaler is not None:
+                checkpoint_dict['scaler_state_dict'] = scaler.state_dict()
+            torch.save(checkpoint_dict, checkpoint_path)
 
         # Save epoch checkpoint
         checkpoint_path = os.path.join(args.checkpoint_dir, f"transformer_epoch_{epoch+1}.pth")
         print(f"\033[96m💿 Saving checkpoint to {checkpoint_path}\033[0m", file=sys.stderr)
-        torch.save({
+        checkpoint_dict = {
             'epoch': epoch + 1,
             'model_state_dict': transformer.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': scaler.state_dict(),
-            'val_loss': avg_val_loss
-        }, checkpoint_path)
+            'val_loss': avg_val_loss,
+            'use_bfloat16': use_bfloat16
+        }
+        if scaler is not None:
+            checkpoint_dict['scaler_state_dict'] = scaler.state_dict()
+        torch.save(checkpoint_dict, checkpoint_path)
         print(f"\033[92m✅ Epoch {epoch+1}: Checkpoint saved\033[0m", file=sys.stderr)
 
         transformer.train()

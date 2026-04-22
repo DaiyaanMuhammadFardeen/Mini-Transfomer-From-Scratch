@@ -1,0 +1,31 @@
+Traceback (most recent call last):
+  File "/home/daiyaan2002/Desktop/Projects/Mini-Transfomer-From-Scratch/analyze_inference_results.py", line 53, in <module>
+    df['commit_type'] = df['diff_text'].apply(lambda x: extract_commit_types(x)[0])
+                        ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/site-packages/pandas/core/series.py", line 4943, in apply
+    ).apply()
+      ~~~~~^^
+  File "/usr/lib/python3.14/site-packages/pandas/core/apply.py", line 1422, in apply
+    return self.apply_standard()
+           ~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/site-packages/pandas/core/apply.py", line 1502, in apply_standard
+    mapped = obj._map_values(
+        mapper=curried, na_action=action, convert=self.convert_dtype
+    )
+  File "/usr/lib/python3.14/site-packages/pandas/core/base.py", line 925, in _map_values
+    return algorithms.map_array(arr, mapper, na_action=na_action, convert=convert)
+           ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/site-packages/pandas/core/algorithms.py", line 1743, in map_array
+    return lib.map_infer(values, mapper, convert=convert)
+           ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pandas/_libs/lib.pyx", line 2999, in pandas._libs.lib.map_infer
+  File "/home/daiyaan2002/Desktop/Projects/Mini-Transfomer-From-Scratch/analyze_inference_results.py", line 53, in <lambda>
+    df['commit_type'] = df['diff_text'].apply(lambda x: extract_commit_types(x)[0])
+                                                        ~~~~~~~~~~~~~~~~~~~~^^^
+  File "/home/daiyaan2002/Desktop/Projects/Mini-Transfomer-From-Scratch/analyze_inference_results.py", line 29, in extract_commit_types
+    if '<ADD>' in diff_text or '<MODIFY>' in diff_text or '<REMOVE>' in diff_text:
+       ^^^^^^^^^^^^^^^^^^^^
+TypeError: argument of type 'float' is not a container or iterable
+Successfully loaded data with shape: (131, 3)
+Error occurred: argument of type 'float' is not a container or iterable
+Full traceback:

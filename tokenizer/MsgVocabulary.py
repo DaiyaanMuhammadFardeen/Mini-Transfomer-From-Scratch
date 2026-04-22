@@ -326,6 +326,22 @@ class MsgVocabulary:
         return embedding_tokens + main_tokens
 
     @staticmethod
+    def pre_tokenize_static(text: str) -> List[str]:
+        """Static version of pre_tokenize for streaming frequency counting."""
+        # Normalize and split the main text
+        text = ' '.join(text.split())
+        pattern = r"""
+            (?:[A-Z][a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)|[a-z]+|[A-Z]+)|
+            (?:\w+(?:_\w+)+)|
+            (?:\d+\.\d+(?:\.\d+)*)|
+            (?:[a-zA-Z0-9]+(?:[/.][a-zA-Z0-9]+)+)|
+            (?:[#@]\w+)|
+            (?:\w+)|
+            (?:[^\w\s])
+        """
+        return re.findall(pattern, text, re.VERBOSE)
+
+    @staticmethod
     def _count_pairs_chunk(word_chunk: List[Tuple[tuple, int]]) -> Dict[Tuple[str, str], int]:
         """Count pairs in a chunk of words (for parallel processing)."""
         pairs = defaultdict(int)
@@ -440,8 +456,12 @@ class MsgVocabulary:
                     if token.lower().replace('<', '').replace('>', '').replace('_', ' ') in text.lower():
                         word_counts[token] += 1
 
-                # Process the actual text
+                # Process the actual text - preserve special tokens, lowercase rest
                 text = ' '.join(text.split())
+                # Preserve uppercase special tokens like <TYPE_FIX>
+                parts = re.split(r'(<[^>]+>)', text)
+                normalized = ''.join(p if p.startswith('<') and p.endswith('>') else p.lower() for p in parts)
+                
                 pattern = r"""
                     (?:[A-Z][a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)|[a-z]+|[A-Z]+)|
                     (?:\w+(?:_\w+)+)|
@@ -451,7 +471,7 @@ class MsgVocabulary:
                     (?:\w+)|
                     (?:[^\w\s])
                 """
-                tokens = re.findall(pattern, text.lower(), re.VERBOSE)
+                tokens = re.findall(pattern, normalized, re.VERBOSE)
                 word_counts.update(tokens)
         return word_counts
 
@@ -588,6 +608,126 @@ class MsgVocabulary:
             print(f"\033[92m   • Merges performed: {merge_count:,}\033[0m", file=sys.stderr)
             print(f"\033[92m   • Final word forms: {len(word_freqs):,}\033[0m", file=sys.stderr)
 
+    def build_vocab_from_frequencies(self, word_freqs: Counter, verbose: bool = True):
+        """
+        Build vocabulary from pre-computed word frequencies (streaming approach).
+        This avoids loading the entire dataset into memory.
+        
+        Args:
+            word_freqs: Counter mapping words to their frequencies
+            verbose: Whether to print progress information
+        """
+        if verbose:
+            print(f"\033[95m{'='*70}\033[0m", file=sys.stderr)
+            print(f"\033[95m⚡ Enhanced BPE Training from Frequencies\033[0m", file=sys.stderr)
+            print(f"\033[95m{'='*70}\033[0m", file=sys.stderr)
+            print(f"\033[96m📊 Unique words: {len(word_freqs):,}\033[0m", file=sys.stderr)
+            print(f"\033[96m🎯 Target vocab: {self.vocab_size:,}\033[0m", file=sys.stderr)
+            print(f"\033[96m⚙️  Workers: {self.n_workers}\033[0m", file=sys.stderr)
+
+        # Step 1: Character conversion
+        print(f"\n\033[94m🔄 Step 1: Character conversion...\033[0m", file=sys.stderr)
+        word_freqs_tuple = {tuple(list(word) + ['</w>']): freq for word, freq in word_freqs.items()}
+
+        # Initialize vocabulary
+        next_idx = len(self.special_tokens)
+        all_chars = set()
+        for word in word_freqs_tuple.keys():
+            all_chars.update(word)
+
+        for char in sorted(all_chars):
+            # Skip adding space characters to vocabulary
+            if char != ' ' and char != '</w>' and char not in self.stoi:
+                self.stoi[char] = next_idx
+                self.itos[next_idx] = char
+                next_idx += 1
+
+        if verbose:
+            print(f"\033[92m✓ Initial vocab: {len(self.stoi):,}\033[0m", file=sys.stderr)
+
+        # Step 2: ULTRA-FAST PARALLEL BPE MERGES
+        print(f"\n\033[94m🔄 Step 2: Parallel BPE merges...\033[0m", file=sys.stderr)
+        print(f"\033[96m⚡ Using {self.n_workers} parallel workers per operation\033[0m", file=sys.stderr)
+
+        num_merges = self.vocab_size - len(self.stoi)
+        merge_count = 0
+
+        # Optimization: Recompute stats only when needed
+        pairs_cache = None
+        cache_valid = False
+
+        with tqdm(total=num_merges, desc="Merging", file=sys.stderr) as pbar:
+            for i in range(num_merges):
+                # PARALLEL: Get pair statistics
+                if not cache_valid:
+                    pairs_cache = self._parallel_pair_stats(word_freqs_tuple)
+                    cache_valid = True
+
+                if not pairs_cache:
+                    if verbose:
+                        print(f"\n\033[93m⚠️  No more pairs\033[0m", file=sys.stderr)
+                    break
+
+                # Find best pair (deterministic)
+                best_pair = max(pairs_cache.items(), key=lambda x: (x[1], x[0]))[0]
+                best_freq = pairs_cache[best_pair]
+
+                # Skip merging involving space characters or </w> tokens
+                if best_pair[0].isspace() or best_pair[1].isspace() or best_pair[0] == '</w>' or best_pair[1] == '</w>':
+                    del pairs_cache[best_pair]
+                    cache_valid = False
+                    continue
+
+                if best_freq < self.min_frequency:
+                    if verbose:
+                        print(f"\n\033[93m⚠️  Frequency threshold\033[0m", file=sys.stderr)
+                    break
+
+                # PARALLEL: Merge operation
+                word_freqs_tuple = self._parallel_merge(word_freqs_tuple, best_pair)
+
+                # Invalidate cache (stats changed after merge)
+                cache_valid = False
+
+                # Record merge
+                merged_token = ''.join(best_pair)
+                self.merges[best_pair] = merged_token
+                self.merge_order.append(best_pair)
+
+                if merged_token not in self.stoi:
+                    self.stoi[merged_token] = next_idx
+                    self.itos[next_idx] = merged_token
+                    next_idx += 1
+
+                merge_count += 1
+
+                # Update progress less frequently for speed
+                if merge_count % 5 == 0:
+                    pbar.set_postfix({
+                        'freq': f"{best_freq:,}",
+                        'vocab': f"{len(self.stoi):,}",
+                        'words': f"{len(word_freqs_tuple):,}"
+                    })
+                    pbar.update(5)
+
+                # Periodic logging
+                if verbose and merge_count % 50 == 0:
+                    print(f"\n\033[96m📊 {merge_count:,}/{num_merges:,} ({100*merge_count/num_merges:.1f}%)\033[0m", file=sys.stderr)
+                    print(f"\033[96m   '{best_pair[0]}'+'{best_pair[1]}' → '{merged_token}' (freq: {best_freq:,})\033[0m", file=sys.stderr)
+                    print(f"\033[96m   Unique word forms: {len(word_freqs_tuple):,}\033[0m", file=sys.stderr)
+
+        # Final update
+        pbar.update(merge_count % 5)
+
+        self.is_trained = True
+
+        if verbose:
+            print(f"\n\033[95m{'='*70}\033[0m", file=sys.stderr)
+            print(f"\033[92m✅ Complete!\033[0m", file=sys.stderr)
+            print(f"\033[92m   • Final vocab size: {len(self.stoi):,}\033[0m", file=sys.stderr)
+            print(f"\033[92m   • Merges performed: {merge_count:,}\033[0m", file=sys.stderr)
+            print(f"\033[92m   • Final word forms: {len(word_freqs_tuple):,}\033[0m", file=sys.stderr)
+
     def tokenize(self, text: str) -> List[str]:
         """Tokenize using embedding-aware BPE."""
         if not self.is_trained:
@@ -596,8 +736,13 @@ class MsgVocabulary:
         # Extract embedding tokens first
         embedding_tokens = self._extract_embedding_tokens(text)
 
+        # Preserve special tokens (uppercase), lowercase everything else
+        # This prevents <TYPE_FIX> from becoming <type_fix> and turning into UNK
+        parts = re.split(r'(<[^>]+>)', text)
+        normalized = ''.join(p if p.startswith('<') and p.endswith('>') else p.lower() for p in parts)
+        
         # Tokenize the main text
-        words = self.pre_tokenize(text.lower())
+        words = self.pre_tokenize(normalized)
         # Filter out the embedding tokens from the main text to avoid duplication
         main_tokens = [w for w in words if w not in self.special_tokens]
 

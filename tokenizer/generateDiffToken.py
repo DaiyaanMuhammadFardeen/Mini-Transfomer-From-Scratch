@@ -1,43 +1,63 @@
 from DiffVocabulary import DiffVocabulary
-import pandas as pd
+import pyarrow.parquet as pq
 import pickle
 import random
 import json
 import gc
-from visualization import generate_comprehensive_report
+from collections import Counter
+from tqdm import tqdm
 
 
-def load_data(file_path):
-    # Process data in chunks to reduce memory usage
-    chunk_size = 500000
-    all_diffs = []
+def stream_word_frequencies(parquet_path: str, column: str, tokenize_fn, chunk_size: int = 5000) -> Counter:
+    """
+    Stream through parquet row groups, accumulate word frequencies.
+    Never holds more than `chunk_size` rows in memory at once.
+    """
+    pf = pq.ParquetFile(parquet_path)
+    total_freq = Counter()
     
-    for chunk in pd.read_parquet(file_path, engine='pyarrow').iterrows():
-        diff_text = chunk[1]['diff_text']
-        if pd.notna(diff_text):
-            all_diffs.append(str(diff_text))
-        else:
-            all_diffs.append('')
-        
-        # Process in batches to control memory usage
-        if len(all_diffs) % chunk_size == 0:
-            # Force garbage collection
-            gc.collect()
+    # Get total number of rows for progress tracking
+    num_row_groups = pf.num_row_groups
     
-    return all_diffs
+    for batch_idx, batch in enumerate(tqdm(pf.iter_batches(batch_size=chunk_size, columns=[column]), 
+                                            total=num_row_groups,
+                                            desc="Streaming diff data",
+                                            unit="batch")):
+        texts = batch.column(column).to_pylist()
+        for text in texts:
+            if text:
+                for word in tokenize_fn(str(text)):
+                    total_freq[word] += 1
+        del texts  # Explicitly free each batch
+    
+    return total_freq
+
 
 def main():
     file_path = "./diff_text.parquet"
-    diffs = load_data(file_path)
+    
+    # Create a temporary vocabulary instance just for tokenization
+    temp_vocab = DiffVocabulary(target_size=75000)
+    
+    print("Streaming through dataset to collect word frequencies...")
+    word_freqs = stream_word_frequencies(
+        file_path, 
+        'diff_text', 
+        temp_vocab.tokenize,
+        chunk_size=5000
+    )
+    
+    print(f"Collected {len(word_freqs)} unique tokens")
     
     # Force garbage collection before building vocabulary
+    del temp_vocab
     gc.collect()
 
     diff_vocab = DiffVocabulary(target_size=75000)
-    diff_vocab.build_vocabulary(diffs)
+    diff_vocab.build_vocabulary_from_frequencies(word_freqs)
     
-    # Delete diffs to free memory
-    del diffs
+    # Delete word_freqs to free memory
+    del word_freqs
     gc.collect()
     
     with open("diff_vocab.pkl", "wb") as f:
@@ -61,14 +81,6 @@ def main():
         json.dump(diff_tokenized, f, ensure_ascii=False, indent=4)
 
     print("✅ Diff vocabulary saved! Tokenized samples exported to JSON.")
-    
-    # Generate visualizations for the diff vocabulary
-    print("Generating visualizations for diff vocabulary...")
-    sample_texts = ["Fix security vulnerability in JWT authentication with Python Django and PostgreSQL",
-                    "Add new feature for user authentication using React and Node.js",
-                    "Refactor data processing module for better performance with caching"]
-    generate_comprehensive_report(diff_vocab, "DiffVocabulary", diff_vocab, "DiffVocabulary", sample_texts)
-    print("✅ Visualizations generated for diff vocabulary!")
 
 if __name__ == "__main__":
     main()

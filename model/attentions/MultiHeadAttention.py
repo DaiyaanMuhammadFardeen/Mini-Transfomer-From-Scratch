@@ -17,8 +17,8 @@ class MultiHeadAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
         
-# Initialize rotary positional encoding
-        self.rotary_encoding = RotaryPositionalEncoding(self.num_heads)
+        # Initialize rotary positional encoding with correct head dimension
+        self.rotary_encoding = RotaryPositionalEncoding(head_dim=self.d_k)
 
     def scaled_dot_product_attention(self, Q, K, V, mask=None):
         seq_len = Q.size(2)

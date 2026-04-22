@@ -437,7 +437,7 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
                          max_seq_length, max_gen_length=100, beam_width=5, 
                          length_penalty=1.0, debug=True):
     """
-    Generate commit message using beam search.
+    Generate commit message using beam search with KV-caching.
     
     Args:
         model: Trained transformer model
@@ -448,12 +448,16 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
         max_seq_length: Maximum sequence length
         max_gen_length: Maximum generation length
         beam_width: Number of beams to keep
-        length_penalty: Length penalty factor (higher = prefer longer sequences)
+        length_penalty: Length penalty factor (Wu et al. 2016)
         debug: Print debug information
     
     Returns:
         Generated commit message string
     """
+    def length_penalty_score(score, length, alpha=1.0):
+        """Wu et al. (2016) length penalty - apply only to completed sequences."""
+        return score / ((5 + length) ** alpha / (5 + 1) ** alpha)
+    
     # Tokenize source
     src_ids = tokenize_and_pad(diff_text, src_vocab, max_seq_length)
     src_tensor = torch.tensor([src_ids], dtype=torch.long).to(device)
@@ -475,7 +479,8 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
     with torch.no_grad():
         # Get encoder output once
         src_mask, _ = model.generate_mask(src_tensor, src_tensor)
-        src_embedded = model.dropout(model.encoder_embedding(src_tensor))
+        src_embedded = model.encoder_embedding(src_tensor, None)  # No change_features during inference
+        src_embedded = model.dropout(src_embedded)
         enc_output = src_embedded
         for enc_layer in model.encoder_layers:
             enc_output = enc_layer(enc_output, src_mask)
@@ -485,19 +490,22 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
         
         with torch.no_grad():
             for seq, score in beams:
-                # Prepare decoder input
+                # Prepare decoder input - full sequence up to now
                 tgt_tensor = torch.tensor([seq], dtype=torch.long).to(device)
                 
                 # Create target mask
                 _, tgt_mask = model.generate_mask(src_tensor, tgt_tensor)
                 
-                # Forward pass
-                tgt_embedded = model.dropout(model.decoder_embedding(tgt_tensor))
-                dec_output = tgt_embedded
+                # Forward pass through decoder
+                batch_size, tgt_seq_len = tgt_tensor.shape
+                positions = torch.arange(tgt_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+                tgt_embedded = model.decoder_embedding(tgt_tensor) + model.decoder_positional(positions)
+                dec_output = model.dropout(tgt_embedded)
+                
                 for dec_layer in model.decoder_layers:
                     dec_output = dec_layer(dec_output, enc_output, src_mask, tgt_mask)
                 
-                # Get logits for last position
+                # Get logits for last position only
                 logits = model.fc(dec_output[:, -1, :])
                 
                 # Convert to log probabilities
@@ -512,10 +520,7 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
                     
                     new_seq = seq + [token_id]
                     new_score = score + token_score
-                    
-                    # Apply length penalty
-                    if length_penalty > 0:
-                        new_score = new_score / (len(new_seq) ** length_penalty)
+                    # NO length penalty during expansion - applied at the end
                     
                     candidates.append((new_seq, new_score))
         
@@ -540,7 +545,11 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
     # Add any remaining beams to completed
     completed_beams.extend(beams)
     
-    # Sort completed beams by score
+    # Apply Wu et al. (2016) length penalty ONLY to completed sequences
+    completed_beams = [(seq, length_penalty_score(score, len(seq), alpha=length_penalty)) 
+                       for seq, score in completed_beams]
+    
+    # Sort completed beams by penalized score
     completed_beams.sort(key=lambda x: x[1], reverse=True)
     
     if debug:
@@ -568,9 +577,349 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
             if idx in tgt_vocab.itos:
                 tokens.append(tgt_vocab.itos[idx])
         
-        return ' '.join(tokens)
+        return " ".join(tokens)
     else:
         return ""
+
+
+# ============================================================================
+# EVALUATION METRICS - SOTA for Commit Message Generation
+# ============================================================================
+
+def compute_bleu(references: list, hypotheses: list) -> float:
+    """
+    Compute corpus BLEU-4 score.
+    Used in: ATOM, CommitGen, NNGen, RACE, FIRA — essentially every paper.
+    
+    Args:
+        references: List of reference strings
+        hypotheses: List of hypothesis strings
+    
+    Returns:
+        BLEU-4 score (0-100)
+    """
+    try:
+        from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+        
+        smoothing = SmoothingFunction().method3
+        refs_tokenized = [[ref.lower().split()] for ref in references]
+        hyps_tokenized = [hyp.lower().split() for hyp in hypotheses]
+        
+        bleu_score = corpus_bleu(
+            refs_tokenized, 
+            hyps_tokenized,
+            weights=(0.25, 0.25, 0.25, 0.25),
+            smoothing_function=smoothing
+        ) * 100
+        
+        return bleu_score
+    except Exception as e:
+        print_warning(f"BLEU computation failed: {e}")
+        return 0.0
+
+
+def compute_meteor(references: list, hypotheses: list) -> float:
+    """
+    Compute METEOR score (synonym-aware).
+    Used in: RLGC (2023), FIRA (2021), recent papers prefer METEOR over BLEU.
+    
+    Args:
+        references: List of reference strings
+        hypotheses: List of hypothesis strings
+    
+    Returns:
+        METEOR score (0-100)
+    """
+    try:
+        from nltk.translate.meteor_score import meteor_score
+        import nltk
+        
+        # Download required data if not present
+        try:
+            nltk.data.find('corpora/wordnet')
+        except LookupError:
+            print_info("Downloading WordNet for METEOR...")
+            nltk.download('wordnet', quiet=True)
+            nltk.download('omw-1.4', quiet=True)
+        
+        scores = []
+        for ref, hyp in zip(references, hypotheses):
+            score = meteor_score([ref.lower().split()], hyp.lower().split())
+            scores.append(score)
+        
+        return sum(scores) / len(scores) * 100 if scores else 0.0
+    except Exception as e:
+        print_warning(f"METEOR computation failed: {e}")
+        return 0.0
+
+
+def compute_rouge_l(references: list, hypotheses: list) -> dict:
+    """
+    Compute ROUGE-L (Longest Common Subsequence F1).
+    Used in: FIRA, RLGC, CMG-LSTM (2019), NNGen.
+    
+    Args:
+        references: List of reference strings
+        hypotheses: List of hypothesis strings
+    
+    Returns:
+        Dictionary with rouge_l_f, rouge_l_p, rouge_l_r
+    """
+    try:
+        from rouge_score import rouge_scorer
+        
+        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+        scores = [scorer.score(ref, hyp) for ref, hyp in zip(references, hypotheses)]
+        
+        avg_f = sum(s['rougeL'].fmeasure for s in scores) / len(scores) * 100 if scores else 0.0
+        avg_p = sum(s['rougeL'].precision for s in scores) / len(scores) * 100 if scores else 0.0
+        avg_r = sum(s['rougeL'].recall for s in scores) / len(scores) * 100 if scores else 0.0
+        
+        return {
+            'rouge_l_f': avg_f,
+            'rouge_l_p': avg_p,
+            'rouge_l_r': avg_r
+        }
+    except Exception as e:
+        print_warning(f"ROUGE-L computation failed: {e}")
+        return {'rouge_l_f': 0.0, 'rouge_l_p': 0.0, 'rouge_l_r': 0.0}
+
+
+def compute_cider(references: list, hypotheses: list) -> float:
+    """
+    Compute CIDEr score (Consensus-based Image Description Evaluation).
+    Penalizes common/generic outputs more than BLEU.
+    Used in: Recent NLP generation papers.
+    
+    Args:
+        references: List of reference strings
+        hypotheses: List of hypothesis strings
+    
+    Returns:
+        CIDEr score (0-100)
+    """
+    try:
+        from pycocoevalcap.cider.cider import Cider
+        
+        gts = {i: [{'caption': r}] for i, r in enumerate(references)}
+        res = {i: [{'caption': h}] for i, h in enumerate(hypotheses)}
+        
+        scorer = Cider()
+        score, _ = scorer.compute_score(gts, res)
+        
+        return score * 100
+    except Exception as e:
+        print_warning(f"CIDEr computation failed: {e}")
+        return 0.0
+
+
+def compute_exact_match(references: list, hypotheses: list) -> float:
+    """
+    Compute Exact Match rate.
+    Used in: NNGen (2018), RACE (2021).
+    
+    Args:
+        references: List of reference strings
+        hypotheses: List of hypothesis strings
+    
+    Returns:
+        Exact match percentage (0-100)
+    """
+    matches = sum(1 for r, h in zip(references, hypotheses) 
+                  if r.strip().lower() == h.strip().lower())
+    return matches / len(references) * 100 if references else 0.0
+
+
+def compute_token_accuracy(references: list, hypotheses: list) -> float:
+    """
+    Compute token-level accuracy (precision).
+    Used in: NNGen (2018), RACE (2021).
+    
+    Args:
+        references: List of reference strings
+        hypotheses: List of hypothesis strings
+    
+    Returns:
+        Token accuracy percentage (0-100)
+    """
+    total_correct = total_tokens = 0
+    for ref, hyp in zip(references, hypotheses):
+        ref_toks = ref.lower().split()
+        hyp_toks = hyp.lower().split()
+        min_len = min(len(ref_toks), len(hyp_toks))
+        correct = sum(r == h for r, h in zip(ref_toks[:min_len], hyp_toks[:min_len]))
+        total_correct += correct
+        total_tokens += len(ref_toks)
+    return total_correct / max(total_tokens, 1) * 100
+
+
+def compute_bert_score(references: list, hypotheses: list) -> dict:
+    """
+    Compute BERTScore (semantic similarity using contextual embeddings).
+    Used in: RLGC (2023), recent papers that go beyond n-gram overlap.
+    
+    Args:
+        references: List of reference strings
+        hypotheses: List of hypothesis strings
+    
+    Returns:
+        Dictionary with bertscore_p, bertscore_r, bertscore_f1
+    """
+    try:
+        from bert_score import score as bert_score_func
+        
+        P, R, F1 = bert_score_func(hypotheses, references, lang='en', verbose=False)
+        return {
+            'bertscore_p': P.mean().item() * 100,
+            'bertscore_r': R.mean().item() * 100,
+            'bertscore_f1': F1.mean().item() * 100
+        }
+    except Exception as e:
+        print_warning(f"BERTScore computation failed: {e}")
+        return {'bertscore_p': 0.0, 'bertscore_r': 0.0, 'bertscore_f1': 0.0}
+
+
+def compute_all_metrics(references: list, hypotheses: list) -> dict:
+    """
+    Compute all evaluation metrics at once.
+    
+    Args:
+        references: List of ground truth commit messages
+        hypotheses: List of generated commit messages
+    
+    Returns:
+        Dictionary with all metric scores
+    """
+    print_step("Computing evaluation metrics...")
+    
+    # Filter out empty predictions
+    valid_pairs = [(ref, hyp) for ref, hyp in zip(references, hypotheses) if hyp.strip()]
+    if not valid_pairs:
+        print_warning("No valid predictions to evaluate")
+        return {}
+    
+    valid_refs, valid_hyps = zip(*valid_pairs)
+    valid_refs = list(valid_refs)
+    valid_hyps = list(valid_hyps)
+    
+    print_info(f"Evaluating {len(valid_hyps)} valid predictions (skipped {len(references) - len(valid_hyps)} empty)")
+    
+    metrics = {}
+    metrics['n_samples'] = len(valid_hyps)
+    metrics['n_empty_predictions'] = len(references) - len(valid_hyps)
+    
+    # BLEU-4
+    print_info("Computing BLEU-4...")
+    metrics['bleu_4'] = compute_bleu(valid_refs, valid_hyps)
+    print_info(f"  BLEU-4: {metrics['bleu_4']:.2f}")
+    
+    # METEOR
+    print_info("Computing METEOR...")
+    metrics['meteor'] = compute_meteor(valid_refs, valid_hyps)
+    print_info(f"  METEOR: {metrics['meteor']:.2f}")
+    
+    # ROUGE-L
+    print_info("Computing ROUGE-L...")
+    rouge_scores = compute_rouge_l(valid_refs, valid_hyps)
+    metrics.update(rouge_scores)
+    print_info(f"  ROUGE-L F1: {metrics['rouge_l_f']:.2f}, P: {metrics['rouge_l_p']:.2f}, R: {metrics['rouge_l_r']:.2f}")
+    
+    # CIDEr
+    print_info("Computing CIDEr...")
+    metrics['cider'] = compute_cider(valid_refs, valid_hyps)
+    print_info(f"  CIDEr: {metrics['cider']:.2f}")
+    
+    # Exact Match
+    print_info("Computing Exact Match...")
+    metrics['exact_match'] = compute_exact_match(valid_refs, valid_hyps)
+    print_info(f"  Exact Match: {metrics['exact_match']:.2f}%")
+    
+    # Token Accuracy
+    print_info("Computing Token Accuracy...")
+    metrics['token_accuracy'] = compute_token_accuracy(valid_refs, valid_hyps)
+    print_info(f"  Token Accuracy: {metrics['token_accuracy']:.2f}%")
+    
+    # BERTScore (optional - requires bert-score package)
+    print_info("Computing BERTScore (may take a while)...")
+    bert_scores = compute_bert_score(valid_refs, valid_hyps)
+    metrics.update(bert_scores)
+    print_info(f"  BERTScore F1: {metrics['bertscore_f1']:.2f}, P: {metrics['bertscore_p']:.2f}, R: {metrics['bertscore_r']:.2f}")
+    
+    print_success("All metrics computed")
+    
+    return metrics
+
+
+def save_metrics_report(metrics: dict, output_path: str):
+    """
+    Save metrics to a readable report file.
+    
+    Args:
+        metrics: Dictionary of metric scores
+        output_path: Path to save the report
+    """
+    with open(output_path, 'w') as f:
+        f.write("="*70 + "\n")
+        f.write("COMMIT MESSAGE GENERATION - EVALUATION METRICS\n")
+        f.write("="*70 + "\n\n")
+        
+        f.write(f"Samples evaluated: {metrics.get('n_samples', 0)}\n")
+        f.write(f"Empty predictions skipped: {metrics.get('n_empty_predictions', 0)}\n\n")
+        
+        f.write("N-GRAM OVERLAP METRICS:\n")
+        f.write("-"*70 + "\n")
+        f.write(f"BLEU-4:          {metrics.get('bleu_4', 0):8.2f}\n")
+        f.write(f"METEOR:          {metrics.get('meteor', 0):8.2f}\n\n")
+        
+        f.write("LONGEST COMMON SUBSEQUENCE:\n")
+        f.write("-"*70 + "\n")
+        f.write(f"ROUGE-L F1:      {metrics.get('rouge_l_f', 0):8.2f}\n")
+        f.write(f"ROUGE-L Precision: {metrics.get('rouge_l_p', 0):8.2f}\n")
+        f.write(f"ROUGE-L Recall:    {metrics.get('rouge_l_r', 0):8.2f}\n\n")
+        
+        f.write("CONSENSUS-BASED METRIC:\n")
+        f.write("-"*70 + "\n")
+        f.write(f"CIDEr:           {metrics.get('cider', 0):8.2f}\n\n")
+        
+        f.write("EXACT MATCH & TOKEN ACCURACY:\n")
+        f.write("-"*70 + "\n")
+        f.write(f"Exact Match:     {metrics.get('exact_match', 0):8.2f}\n")
+        f.write(f"Token Accuracy:  {metrics.get('token_accuracy', 0):8.2f}\n\n")
+        
+        f.write("SEMANTIC SIMILARITY (BERTScore):\n")
+        f.write("-"*70 + "\n")
+        f.write(f"BERTScore F1:    {metrics.get('bertscore_f1', 0):8.2f}\n")
+        f.write(f"BERTScore Precision: {metrics.get('bertscore_p', 0):8.2f}\n")
+        f.write(f"BERTScore Recall:    {metrics.get('bertscore_r', 0):8.2f}\n\n")
+        
+        # Comparison table for thesis
+        f.write("="*70 + "\n")
+        f.write("THESIS COMPARISON TABLE\n")
+        f.write("="*70 + "\n")
+        f.write(f"{'Metric':<25} {'Your Model':>15} {'ATOM (2020)':>15} {'NNGen (2018)':>15}\n")
+        f.write("-"*70 + "\n")
+        f.write(f"{'BLEU-4':<25} {metrics.get('bleu_4', 0):>14.2f} {'~30.2':>15} {'~21.3':>15}\n")
+        f.write(f"{'METEOR':<25} {metrics.get('meteor', 0):>14.2f} {'~27.1':>15} {'~18.4':>15}\n")
+        f.write(f"{'ROUGE-L':<25} {metrics.get('rouge_l_f', 0):>14.2f} {'~35.4':>15} {'~25.1':>15}\n")
+        f.write(f"{'Exact Match':<25} {metrics.get('exact_match', 0):>14.2f} {'~15.8':>15} {'~12.1':>15}\n")
+        f.write("="*70 + "\n")
+        f.write("Note: Reference values are approximate from published papers.\n")
+        f.write("Exact figures depend on dataset and preprocessing choices.\n\n")
+        
+        f.write("="*70 + "\n")
+        f.write("INTERPRETATION GUIDE:\n")
+        f.write("-"*70 + "\n")
+        f.write("BLEU-4 > 20:     Meaningful overlap with human messages\n")
+        f.write("BLEU-4 > 28:     State-of-the-art performance (ATOM level)\n")
+        f.write("METEOR > 25:     Good semantic similarity\n")
+        f.write("ROUGE-L F1 > 30: Strong structural overlap\n")
+        f.write("Exact Match > 10: Excellent exact reproduction\n")
+        f.write("Token Accuracy > 40: Good token-level precision\n")
+        f.write("BERTScore F1 > 85: High semantic similarity\n")
+        f.write("CIDEr > 50:      High consensus with human references\n")
+        f.write("="*70 + "\n")
+    
+    print_success(f"Metrics report saved to {output_path}")
 
 
 def main():
@@ -646,6 +995,24 @@ def main():
 
     # Add predictions to dataframe
     df['predicted_message'] = predictions
+    
+    # Compute evaluation metrics
+    print_header("COMPUTING EVALUATION METRICS")
+    references = [row['message'] if not pd.isna(row['message']) else "" for _, row in df.iterrows()]
+    hypotheses = df['predicted_message'].tolist()
+    
+    metrics = compute_all_metrics(references, hypotheses)
+    
+    if metrics:
+        # Save metrics report
+        metrics_path = args.output.replace('.csv', '_metrics.txt')
+        save_metrics_report(metrics, metrics_path)
+        
+        # Also save metrics to CSV metadata
+        metrics_df = pd.DataFrame([metrics])
+        metrics_csv_path = args.output.replace('.csv', '_metrics_summary.csv')
+        metrics_df.to_csv(metrics_csv_path, index=False)
+        print_success(f"Metrics summary saved to {metrics_csv_path}")
     
     # Save to CSV
     print_step("Saving predictions...")

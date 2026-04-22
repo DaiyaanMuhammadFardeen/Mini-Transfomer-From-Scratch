@@ -2,6 +2,9 @@ import torch
 from torch.utils.data import Dataset
 
 class CodeDiffDataset(Dataset):
+    # Define change-type tag names at class level for efficiency
+    CHANGE_TYPE_TAGS = ['<ADD>', '<REMOVE>', '<MODIFY>',
+                        '<COMMENT_ADD>', '<COMMENT_REMOVE>', '<COMMENT_MODIFY>']
     def __init__(self, messages, diffs, src_vocab, tgt_vocab, max_seq_length):
         self.messages = messages
         self.diffs = diffs
@@ -29,12 +32,33 @@ class CodeDiffDataset(Dataset):
         src_tokens = torch.tensor(src_tokens, dtype=torch.long)
         tgt_tokens = torch.tensor(tgt_tokens, dtype=torch.long)
         
-        # For now, return just the tokens since we don't have the additional features yet
-        # In a full implementation, this would include additional feature tensors
-        return src_tokens, tgt_tokens
+        # Extract change-type features from diff tokens
+        change_features = self._extract_change_features(src_tokens)
+        
+        return src_tokens, tgt_tokens, change_features
 
     def tokenize_text(self, text, vocab):
         return vocab.numericalize(text)
+    
+    def _extract_change_features(self, src_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Scan tokenized diff for structural change-type tags.
+        Returns a (6,) float32 binary tensor.
+
+        Index mapping:
+            0: <ADD>            present
+            1: <REMOVE>         present
+            2: <MODIFY>         present
+            3: <COMMENT_ADD>    present
+            4: <COMMENT_REMOVE> present
+            5: <COMMENT_MODIFY> present
+        """
+        features = torch.zeros(6, dtype=torch.float32)
+        for i, tag in enumerate(self.CHANGE_TYPE_TAGS):
+            tag_id = self.src_vocab.stoi.get(tag, -1)
+            if tag_id != -1 and (src_tokens == tag_id).any():
+                features[i] = 1.0
+        return features
 
     def get_multimodal_features(self, idx):
         """

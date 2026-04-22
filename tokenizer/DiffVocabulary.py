@@ -893,9 +893,10 @@ class DiffVocabulary:
         character_freqs = defaultdict(int)
         subwords_freqs = defaultdict(int)
         
-        # Process subwords in batches to manage memory
+        # Process subwords in batches to manage memory with progress tracking
+        word_freqs_items = list(word_freqs.items())
         sentences_processed = 0
-        for word, freq in word_freqs.items():
+        for word, freq in tqdm(word_freqs_items, desc="Extracting subwords", unit="word"):
             word = str(word)
             for i in range(len(word)):
                 character_freqs[word[i]] += freq
@@ -931,7 +932,71 @@ class DiffVocabulary:
 
         sorted_tokens = sorted(model, key=model.get)
         idx = len(self.itos)
-        for word in sorted_tokens:
+        for word in tqdm(sorted_tokens, desc="Building final vocabulary", unit="token"):
+            if word not in self.stoi:
+                self.stoi[word] = idx
+                self.itos[idx] = word
+                idx += 1
+
+        print(f"✅ Multimodal vocabulary built! Total tokens: {len(self.stoi)}", file=sys.stderr)
+
+    def build_vocabulary_from_frequencies(self, word_freqs):
+        """
+        Build vocabulary from pre-computed word frequencies (streaming approach).
+        This avoids loading the entire dataset into memory.
+        
+        Args:
+            word_freqs: Counter or dict mapping tokens to their frequencies
+        """
+        print(f"🧠 Building multimodal vocabulary from pre-computed frequencies...", file=sys.stderr)
+        
+        # Apply aggressive pre-filtering to focus on embedding-relevant tokens
+        word_freqs = self._aggressive_prefilter(word_freqs)
+
+        MAX_SUBWORD_LEN = 10
+        character_freqs = defaultdict(int)
+        subwords_freqs = defaultdict(int)
+        
+        # Process subwords in batches to manage memory with progress tracking
+        word_freqs_items = list(word_freqs.items())
+        sentences_processed = 0
+        for word, freq in tqdm(word_freqs_items, desc="Extracting subwords", unit="word"):
+            word = str(word)
+            for i in range(len(word)):
+                character_freqs[word[i]] += freq
+                for j in range(i + 2, min(i + MAX_SUBWORD_LEN + 1, len(word) + 1)):
+                    subwords_freqs[word[i:j]] += freq
+            
+            sentences_processed += 1
+            if sentences_processed % 10000 == 0:  # Periodic garbage collection
+                gc.collect()
+
+        sorted_subwords = sorted(subwords_freqs.items(), key=lambda x: x[1], reverse=True)
+        token_freqs = list(character_freqs.items()) + sorted_subwords[:2 * self.target_size - len(character_freqs)]
+        del character_freqs, subwords_freqs  # Free memory
+        gc.collect()
+
+        token_freqs = {token: freq for token, freq in token_freqs if freq >= self.freq_threshold}
+        total_sum = sum(token_freqs.values())
+
+        if total_sum <= 0:
+            print("[ERROR] No valid tokens after subword extraction", file=sys.stderr)
+            return
+
+        token_freqs = self._heuristic_preprune(token_freqs)
+        model = {token: -log(freq / total_sum) for token, freq in token_freqs.items()}
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model = self._train_unigram_model(word_freqs, model, num_iters=5, device=device)
+        self.trained_model = model
+        model = self._smart_prune_with_caching(model, word_freqs, device=device)
+
+        del token_freqs
+        gc.collect()
+
+        sorted_tokens = sorted(model, key=model.get)
+        idx = len(self.itos)
+        for word in tqdm(sorted_tokens, desc="Building final vocabulary", unit="token"):
             if word not in self.stoi:
                 self.stoi[word] = idx
                 self.itos[idx] = word
