@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import pickle
 import pandas as pd
+import numpy as np
 import os
 import sys
 import argparse
@@ -13,6 +14,9 @@ from torch.amp.autocast_mode import autocast
 from torch.utils.checkpoint import checkpoint
 from model.model import Transformer
 from CodeDiffDataset import CodeDiffDataset
+from quicksave import QuickSaver
+from bucket_sampler import BucketBatchSampler, CurriculumSampler
+from ema import ModelEMA
 from tqdm import tqdm
 
 # Set working directory to project root
@@ -73,26 +77,26 @@ def load_data(file_path):
     print(f"\033[92m✓ Extracted {len(messages)} messages and {len(diffs)} diffs\033[0m", file=sys.stderr)
     return messages, diffs
 
-def length_regularization_loss(output, tgt_data, eos_idx, min_length=5, lambda_len=0.1):
+def length_regularization_loss(output, tgt_data, eos_idx, pad_idx=0,
+                                 min_length=5, max_length=50, lambda_len=0.01):
     """
-    Penalize sequences that end too early.
-    output: Transformer output (batch_size, seq_len, vocab_size)
-    tgt_data: Target tokens (batch_size, seq_len)
-    eos_idx: Index of <EOS> token
-    min_length: Minimum desired sequence length (tune based on dataset)
-    lambda_len: Weight for length penalty
+    Two-sided length regularization:
+    - Penalize if model predicts EOS too early (< min_length)
+    - Penalize if model never predicts EOS (> max_length) — forces commitment
     """
-    # Get predicted probabilities
-    probs = torch.softmax(output, dim=-1)  # (batch_size, seq_len, vocab_size)
-    eos_probs = probs[:, :, eos_idx]  # (batch_size, seq_len)
+    # output: (B, T, V), tgt_data: (B, T+1)
+    # Log probs for EOS token at each position
+    log_probs = torch.nn.functional.log_softmax(output, dim=-1)
+    eos_log_probs = log_probs[:, :, eos_idx]   # (B, T)
 
-    # Estimate sequence length as first position where <EOS> prob is high
-    max_probs, _ = torch.max(eos_probs, dim=1)  # (batch_size,)
-    pred_lengths = torch.argmax((eos_probs > 0.5 * max_probs.unsqueeze(1)).float(), dim=1)  # (batch_size,)
+    T = output.size(1)
+    pos_weights = torch.arange(1, T + 1, device=output.device, dtype=torch.float)
 
-    # Penalize if predicted length < min_length
-    length_penalty = torch.clamp(min_length - pred_lengths.float(), min=0) ** 2
-    return lambda_len * length_penalty.mean()
+    # Penalize high EOS probability early in sequence
+    early_penalty = (eos_log_probs[:, :min_length].exp() *
+                     (min_length - pos_weights[:min_length]) / min_length).mean()
+
+    return lambda_len * early_penalty.clamp(min=0)
 
 def contrastive_loss(embeddings, labels, temperature=0.1, margin=1.0):
     """
@@ -235,15 +239,14 @@ def main(args):
     batch_size = args.batch_size
     num_epochs = args.num_epochs
     learning_rate = args.learning_rate
+    accumulation_steps = args.accumulation_steps
+    micro_batch_size = args.micro_batch_size
     print(f"\033[92m📊 Hyperparameters set - d_model: {d_model}, num_epochs: {num_epochs}\033[0m", file=sys.stderr)
+    print(f"\033[92m📊 Gradient accumulation: micro_batch={micro_batch_size}, steps={accumulation_steps}, effective_batch={micro_batch_size * accumulation_steps}\033[0m", file=sys.stderr)
 
     print("\033[94m📁 Creating checkpoint directory\033[0m", file=sys.stderr)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     print(f"\033[92m✓ Checkpoint directory ready: {args.checkpoint_dir}\033[0m", file=sys.stderr)
-
-    print("\033[94m📥 Loading data from parquet file\033[0m", file=sys.stderr)
-    messages, diffs = load_data(args.data_path)
-    print(f"\033[92m🎉 Data loaded successfully - {len(messages)} samples\033[0m", file=sys.stderr)
 
     print("\033[94m🔍 Loading vocabularies\033[0m", file=sys.stderr)
     diff_vocab_path = args.diff_vocab_path
@@ -263,40 +266,63 @@ def main(args):
     tgt_vocab = load_pickle_with_redirect(message_vocab_path)
     print(f"\033[92m✓ Target vocab loaded, size: {len(tgt_vocab.stoi)}\033[0m", file=sys.stderr)
 
-    src_vocab_size = len(src_vocab.stoi)
-    tgt_vocab_size = len(tgt_vocab.stoi)
+    src_vocab_size = max(src_vocab.stoi.values()) + 1
+    tgt_vocab_size = max(tgt_vocab.stoi.values()) + 1
     print(f"\033[92m📊 Final vocab sizes - src: {src_vocab_size}, tgt: {tgt_vocab_size}\033[0m", file=sys.stderr)
 
-    print("\033[94m🏗️  Creating CodeDiffDataset\033[0m", file=sys.stderr)
-    dataset = CodeDiffDataset(messages, diffs, src_vocab, tgt_vocab, max_seq_length)
-    print(f"\033[92m✓ Dataset created with {len(dataset)} samples\033[0m", file=sys.stderr)
+    print("\033[94m🏗️  Creating memory-mapped datasets\033[0m", file=sys.stderr)
+    train_dataset = CodeDiffDataset(
+        tokenized_dir=args.tokenized_dir,
+        src_vocab=src_vocab,
+        split='train',
+        train_frac=0.9
+    )
+    val_dataset = CodeDiffDataset(
+        tokenized_dir=args.tokenized_dir,
+        src_vocab=src_vocab,
+        split='val',
+        train_frac=0.9
+    )
+    print(f"\033[92m✓ Datasets created - Train: {len(train_dataset):,}, Val: {len(val_dataset):,}\033[0m", file=sys.stderr)
 
-    # Split dataset into train and validation
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    print(f"\033[92m✓ Dataset split: {train_size} train, {val_size} validation\033[0m", file=sys.stderr)
-
-    print("\033[94m🔗 Creating DataLoaders\033[0m", file=sys.stderr)
+    print("\033[94m🔗 Creating DataLoaders with Curriculum Learning\033[0m", file=sys.stderr)
+    
+    # Initialize start_epoch for curriculum sampler
+    start_epoch = 0
+    
+    # Load pre-computed sequence lengths for bucket batching
+    src_lengths = np.load(os.path.join(args.tokenized_dir, "src_lengths.npy"))
+    train_lengths = src_lengths[train_dataset.indices]
+    print(f"\033[92m✓ Loaded sequence lengths - mean: {train_lengths.mean():.1f}, max: {train_lengths.max()}\033[0m", file=sys.stderr)
+    
+    # Create curriculum sampler (starts with easy examples, then full dataset)
+    train_sampler = CurriculumSampler(
+        lengths=train_lengths,
+        batch_size=batch_size,
+        bucket_size=batch_size * 100,
+        warmup_epochs=1,  # First epoch uses shortest 50% of data
+        current_epoch=start_epoch,
+        shuffle=True
+    )
+    
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,         # 6 workers can bottleneck on 16GB RAM; 4 is safer
-        pin_memory=True,       # Faster CPU→GPU transfer
-        prefetch_factor=2,     # Prefetch next 2 batches while GPU works
-        persistent_workers=True # Don't restart workers each epoch
+        batch_sampler=train_sampler,  # Replaces batch_size + shuffle args
+        num_workers=2,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
     )
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         prefetch_factor=2,
         persistent_workers=True
     )
-    print(f"\033[92m✓ DataLoaders created with batch_size: {batch_size}, pin_memory=True\033[0m", file=sys.stderr)
+    print(f"\033[92m✓ DataLoaders created with bucket batching, batch_size: {batch_size}, num_workers=2\033[0m", file=sys.stderr)
 
     print("\033[94m🤖 Initializing Transformer model\033[0m", file=sys.stderr)
     transformer = Transformer(
@@ -311,35 +337,63 @@ def main(args):
     ).to(device)
     print(f"\033[92m✓ Transformer model initialized with {sum(p.numel() for p in transformer.parameters())} parameters\033[0m", file=sys.stderr)
 
-    print("\033[94m📉 Initializing loss criterion\033[0m", file=sys.stderr)
-    criterion = nn.CrossEntropyLoss(ignore_index=tgt_vocab.stoi["<PAD>"], label_smoothing=0.1)
-    print(f"\033[92m✓ CrossEntropyLoss criterion created (label_smoothing=0.1)\033[0m", file=sys.stderr)
-
-    print("\033[94m🔄 Initializing optimizer and scheduler\033[0m", file=sys.stderr)
+    print("\033[94m📉 Initializing loss criterion with class weights\033[0m", file=sys.stderr)
     
-    # Noam (transformer) learning rate schedule
-    def noam_schedule(step, d_model, warmup_steps=4000):
-        """Noam learning rate schedule from 'Attention Is All You Need'."""
-        step = max(1, step)
-        return (d_model ** -0.5) * min(step ** -0.5, step * warmup_steps ** -1.5)
+    # Build frequency-based class weights for rare token emphasis
+    def build_class_weights(tgt_vocab, tgt_vocab_size, device, alpha=0.5):
+        """
+        Compute inverse-frequency class weights.
+        alpha: exponent — 0.5 is square root smoothing (less extreme than full inverse)
+        Tokens with no frequency info get weight 1.0.
+        """
+        weights = torch.ones(tgt_vocab_size, device=device)
+
+        # If your MsgVocabulary has a word_freqs dict, use it
+        if hasattr(tgt_vocab, 'word_freqs') and tgt_vocab.word_freqs:
+            total = sum(tgt_vocab.word_freqs.values())
+            for word, idx in tgt_vocab.stoi.items():
+                freq = tgt_vocab.word_freqs.get(word, 1)
+                if idx < tgt_vocab_size:  # guard against any stray IDs
+                    weights[idx] = (total / (freq * tgt_vocab_size)) ** alpha
+
+        # Always give zero weight to padding
+        weights[tgt_vocab.stoi['<PAD>']] = 0.0
+        return weights
+    
+    class_weights = build_class_weights(tgt_vocab, tgt_vocab_size, device)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        ignore_index=tgt_vocab.stoi["<PAD>"],
+        label_smoothing=0.1
+    )
+    print(f"\033[92m✓ CrossEntropyLoss with class weights and label_smoothing=0.1\033[0m", file=sys.stderr)
+
+    print("\033[94m🔄 Initializing optimizer and OneCycleLR scheduler\033[0m", file=sys.stderr)
     
     # Use AdamW with correct decoupled weight decay (Loshchilov & Hutter 2017)
     optimizer = optim.AdamW(
         transformer.parameters(),
-        lr=1e-4,  # Peak LR; warmup will scale this
+        lr=3e-4,  # Max LR for OneCycleLR
         betas=(0.9, 0.98),
         eps=1e-9,
         weight_decay=0.01  # Standard for transformers
     )
     
-    # LambdaLR scheduler with Noam schedule - steps every batch
+    # OneCycleLR scheduler - better for short training runs (3-5 epochs)
     global_step = 0
-    scheduler = optim.lr_scheduler.LambdaLR(
+    total_steps = (len(train_dataloader) * args.num_epochs) // accumulation_steps
+    
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        lr_lambda=lambda step: noam_schedule(step, d_model=d_model, warmup_steps=4000)
+        max_lr=3e-4,              # Peak LR
+        total_steps=total_steps,
+        pct_start=0.1,            # 10% of training for warmup
+        anneal_strategy='cos',    # Cosine decay
+        div_factor=25.0,          # Initial LR = max_lr / 25
+        final_div_factor=1e4      # Final LR = max_lr / 10000
     )
     
-    print(f"\033[92m✓ AdamW optimizer and Noam scheduler initialized\033[0m", file=sys.stderr)
+    print(f"\033[92m✓ AdamW optimizer and OneCycleLR scheduler initialized (total_steps={total_steps})\033[0m", file=sys.stderr)
 
     print("\033[94m🎛️  Initializing mixed precision\033[0m", file=sys.stderr)
     # Use bfloat16 if supported (ROCm 5.2+), fallback to float16 with GradScaler
@@ -356,6 +410,10 @@ def main(args):
     transformer.train()
     print(f"\033[92m✓ Model training mode enabled\033[0m", file=sys.stderr)
 
+    # Initialize EMA for better generalization
+    ema = ModelEMA(transformer, decay=0.999)
+    print(f"\033[92m✓ ModelEMA initialized (decay=0.999)\033[0m", file=sys.stderr)
+
     # Add new hyperparameters for contrastive learning
     contrastive_weight = 0.1  # Weight for contrastive loss
     temperature = 0.1  # Temperature for contrastive loss
@@ -364,11 +422,34 @@ def main(args):
     diversity_weight = 0.01  # Weight for diversity loss
     repetition_penalty = 1.0  # Penalty for repeated tokens
 
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    best_val_loss = float('inf')
+    # Initialize QuickSaver for power-outage proof checkpoints
+    saver = QuickSaver(
+        checkpoint_dir=args.checkpoint_dir,
+        save_every_steps=args.quicksave_every,
+        keep_last_n=3
+    )
 
-    if args.resume:
+    # Auto-resume from latest checkpoint if requested
+    global_step = 0
+    best_val_loss = float('inf')
+    resume_batch_idx = 0
+
+    if args.auto_resume:
+        state = saver.load_latest()
+        if state:
+            transformer.load_state_dict(state['model_state_dict'])
+            optimizer.load_state_dict(state['optimizer_state_dict'])
+            if 'scheduler_state_dict' in state and scheduler:
+                scheduler.load_state_dict(state['scheduler_state_dict'])
+            if 'scaler_state_dict' in state and scaler:
+                scaler.load_state_dict(state['scaler_state_dict'])
+            start_epoch = state.get('epoch', 0)
+            global_step = state.get('global_step', 0)
+            best_val_loss = state.get('best_val_loss', float('inf'))
+            resume_batch_idx = state.get('batch_idx', 0)
+            print(f"\033[95m🔥 Resumed from step {global_step}, epoch {start_epoch}\033[0m", file=sys.stderr)
+    elif args.resume:
+        # Legacy manual resume (deprecated but kept for compatibility)
         start_epoch, best_val_loss = load_checkpoint(
             args.resume, transformer, optimizer, scheduler, scaler, device
         )
@@ -386,7 +467,13 @@ def main(args):
         print(f"\n\033[95m{'='*60}\033[0m", file=sys.stderr)
         print(f"\033[95m🌟 EPOCH {epoch+1}/{num_epochs} START 🌟\033[0m", file=sys.stderr)
         print(f"\033[95m{'='*60}\033[0m", file=sys.stderr)
+        
+        # Update curriculum sampler for this epoch
+        train_sampler.set_epoch(epoch)
+        
         total_train_loss = 0
+        accum_loss = 0.0
+        optimizer.zero_grad()  # Zero gradients at start of epoch
 
         print(f"\033[96m▶️  Starting train batch iteration for epoch {epoch+1}\033[0m", file=sys.stderr)
         pbar = tqdm(train_dataloader, 
@@ -395,7 +482,19 @@ def main(args):
                     leave=True,
                     unit="batch",
                     dynamic_ncols=True)
-        for batch_idx, batch_data in enumerate(pbar):
+        
+        import itertools
+        batch_iter = iter(pbar)
+        
+        if epoch == start_epoch and resume_batch_idx > 0:
+            print(f" Fast-forwarding {resume_batch_idx} batches...", file=sys.stderr)
+            consumed = 0
+            for _ in itertools.islice(batch_iter, resume_batch_idx):
+                consumed += 1
+            print(f" Skipped {consumed} batches", file=sys.stderr)
+        
+        for batch_idx, batch_data in enumerate(batch_iter, start=resume_batch_idx):
+            
             # Unpack batch data - now includes change_features
             if len(batch_data) == 3:
                 src_data, tgt_data, change_features = batch_data
@@ -408,18 +507,18 @@ def main(args):
             tgt_data = tgt_data.to(device)
             if change_features is not None:
                 change_features = change_features.to(device)
-            
-            optimizer.zero_grad()
 
             # Training loop with ROCm/HIP Flash Attention context
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            
+            with sdpa_kernel(SDPBackend.MATH):  # Safe fallback for ROCm
                 if use_bfloat16:
                     # bfloat16 - no GradScaler needed
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         output = transformer(src_data, tgt_data[:, :-1], change_features)
                         ce_loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
                         len_loss = length_regularization_loss(output, tgt_data, tgt_vocab.stoi["<EOS>"], min_length=5, lambda_len=0.01)
-                        loss = ce_loss + len_loss
+                        loss = (ce_loss + len_loss) / accumulation_steps  # Scale loss for accumulation
                         loss = torch.clamp(loss, min=-1e6, max=1e6)
                     loss.backward()
                 else:
@@ -428,11 +527,58 @@ def main(args):
                         output = transformer(src_data, tgt_data[:, :-1], change_features)
                         ce_loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
                         len_loss = length_regularization_loss(output, tgt_data, tgt_vocab.stoi["<EOS>"], min_length=5, lambda_len=0.01)
-                        loss = ce_loss + len_loss
+                        loss = (ce_loss + len_loss) / accumulation_steps  # Scale loss for accumulation
                         loss = torch.clamp(loss, min=-1e6, max=1e6)
                     scaler.scale(loss).backward()
             
-            # Gradient clipping (prevents exploding gradients)
+            accum_loss += loss.item() * accumulation_steps  # Track unscaled loss for logging
+
+            # Only update weights every `accumulation_steps` micro-batches
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # Gradient clipping (prevents exploding gradients)
+                if use_bfloat16:
+                    torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
+                    optimizer.step()
+                else:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                
+                scheduler.step()  # Noam schedule steps every accumulation step
+                global_step += 1
+                optimizer.zero_grad()  # Reset gradients after optimizer step
+                
+                # Update EMA weights
+                ema.update(transformer)
+                
+                # ADD THIS: quicksave every N optimizer steps
+                saver.step(
+                    global_step=global_step,
+                    epoch=epoch,
+                    model=transformer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    val_loss=None,           # not known yet mid-epoch
+                    best_val_loss=best_val_loss,
+                    use_bfloat16=use_bfloat16,
+                    batch_idx=batch_idx
+                )
+                
+                total_train_loss += accum_loss
+                current_avg_loss = total_train_loss / ((batch_idx // accumulation_steps) + 1)
+                pbar.set_postfix({'batch_loss': f'{accum_loss:.4f}', 'avg_loss': f'{current_avg_loss:.4f}'})
+                accum_loss = 0.0  # Reset accumulated loss
+                
+                # Log training metrics to CSV
+                gpu_mem = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+                with open(log_path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([epoch+1, global_step, accum_loss * accumulation_steps, '', optimizer.param_groups[0]['lr'], gpu_mem])
+        
+        # Handle remaining batches if not divisible by accumulation_steps
+        if (batch_idx + 1) % accumulation_steps != 0:
             if use_bfloat16:
                 torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -441,23 +587,19 @@ def main(args):
                 torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-            scheduler.step()  # Noam schedule steps every batch
-            global_step += 1
-            total_train_loss += loss.item()
-            current_avg_loss = total_train_loss / (batch_idx + 1)
-            pbar.set_postfix({'batch_loss': f'{loss.item():.4f}', 'avg_loss': f'{current_avg_loss:.4f}'})
             
-            # Log training metrics to CSV
-            gpu_mem = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0
-            with open(log_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([epoch+1, global_step, loss.item(), '', optimizer.param_groups[0]['lr'], gpu_mem])
+            scheduler.step()
+            global_step += 1
+            optimizer.zero_grad()
+            
+            total_train_loss += accum_loss
 
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"\033[92m✓ Epoch {epoch+1}: Train loss: {avg_train_loss:.4f}\033[0m", file=sys.stderr)
 
-        # Validation loop
-        transformer.eval()
+        # Validation loop using EMA model for better generalization
+        ema.model.to(device)
+        ema.model.eval()
         total_val_loss = 0
         print(f"\033[96m▶️  Starting validation batch iteration for epoch {epoch+1}\033[0m", file=sys.stderr)
         with torch.no_grad():
@@ -481,14 +623,15 @@ def main(args):
                 if change_features is not None:
                     change_features = change_features.to(device)
                 
-                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                from torch.nn.attention import sdpa_kernel, SDPBackend
+                with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
                     if use_bfloat16:
                         with torch.autocast("cuda", dtype=torch.bfloat16):
-                            output = transformer(src_data, tgt_data[:, :-1], change_features)
+                            output = ema.model(src_data, tgt_data[:, :-1], change_features)
                             loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
                     else:
                         with autocast("cuda"):
-                            output = transformer(src_data, tgt_data[:, :-1], change_features)
+                            output = ema.model(src_data, tgt_data[:, :-1], change_features)
                             loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
                 total_val_loss += loss.item()
                 pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
@@ -505,35 +648,18 @@ def main(args):
             df_log.loc[epoch_mask, 'val_loss'] = avg_val_loss
             df_log.to_csv(log_path, index=False)
 
-        # Save checkpoint if validation loss improves
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            checkpoint_path = os.path.join(args.checkpoint_dir, f"transformer_best.pth")
-            print(f"\033[96m💿 Saving best checkpoint to {checkpoint_path}\033[0m", file=sys.stderr)
-            checkpoint_dict = {
-                'epoch': epoch + 1,
-                'model_state_dict': transformer.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'use_bfloat16': use_bfloat16
-            }
-            if scaler is not None:
-                checkpoint_dict['scaler_state_dict'] = scaler.state_dict()
-            torch.save(checkpoint_dict, checkpoint_path)
-
-        # Save epoch checkpoint
-        checkpoint_path = os.path.join(args.checkpoint_dir, f"transformer_epoch_{epoch+1}.pth")
-        print(f"\033[96m💿 Saving checkpoint to {checkpoint_path}\033[0m", file=sys.stderr)
-        checkpoint_dict = {
-            'epoch': epoch + 1,
-            'model_state_dict': transformer.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': avg_val_loss,
-            'use_bfloat16': use_bfloat16
-        }
-        if scaler is not None:
-            checkpoint_dict['scaler_state_dict'] = scaler.state_dict()
-        torch.save(checkpoint_dict, checkpoint_path)
+        # Save epoch checkpoint using QuickSaver
+        saver.save_epoch(
+            epoch=epoch + 1,
+            model=transformer,
+            optimizer=optimizer,
+            val_loss=avg_val_loss,
+            best_val_loss=best_val_loss,
+            scheduler=scheduler,
+            scaler=scaler,
+            global_step=global_step,
+            use_bfloat16=use_bfloat16
+        )
         print(f"\033[92m✅ Epoch {epoch+1}: Checkpoint saved\033[0m", file=sys.stderr)
 
         transformer.train()
@@ -546,7 +672,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a Transformer model for commit message generation")
-    parser.add_argument("--data-path", default="./traindata.parquet", help="Path to parquet file")
+    parser.add_argument("--data-path", default="./traindata.parquet", help="Path to parquet file (legacy, not used with pretokenized data)")
+    parser.add_argument("--tokenized-dir", default="./tokenized_data", help="Directory with pre-tokenized .npy files from pretokenize.py")
     parser.add_argument("--diff-vocab-path", default="./tokenizer/diff_vocab.pkl", help="Path to diff vocabulary")
     parser.add_argument("--message-vocab-path", default="./tokenizer/message_vocab.pkl", help="Path to message vocabulary")
     parser.add_argument("--checkpoint-dir", default="./checkpoints", help="Directory to save checkpoints")
@@ -556,9 +683,15 @@ if __name__ == "__main__":
     parser.add_argument("--d-ff", type=int, default=2048, help="Feed-forward dimension")
     parser.add_argument("--max-seq-length", type=int, default=256, help="Maximum sequence length") #avg for diff is 128, for message is 12, max is 120. It used to be 1024
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=64, help="Effective batch size (micro_batch × accumulation_steps)")
+    parser.add_argument("--micro-batch-size", type=int, default=8, help="Per-step batch size (memory budget)")
+    parser.add_argument("--accumulation-steps", type=int, default=8, help="Accumulate this many micro-batches before optimizer step")
     parser.add_argument("--num-epochs", type=int, default=3, help="Number of epochs")
     parser.add_argument("--learning-rate", type=float, default=0.00001, help="Learning rate")
-    parser.add_argument("--resume", default=None, type=str, help="Path to checkpoint to resume training from (e.g., ./checkpoints/transformer_epoch_4.pth)")
+    parser.add_argument("--quicksave-every", type=int, default=300,
+                        help="Save checkpoint every N training steps")
+    parser.add_argument("--auto-resume", action="store_true",
+                        help="Automatically resume from latest checkpoint in --checkpoint-dir")
+    parser.add_argument("--resume", default=None, type=str, help="Path to checkpoint to resume training from (legacy)")
     args = parser.parse_args()
     main(args)

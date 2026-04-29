@@ -14,15 +14,20 @@ class PositionWiseFeedForward(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    """LLaMA-2 / CodeLlama / Mistral default"""
+    """Corrected SwiGLU — LLaMA / Mistral style with proper SiLU activation."""
     def __init__(self, d_model: int, d_ff: int, bias: bool = False):
         super().__init__()
-        self.w1 = nn.Linear(d_model, d_ff, bias=bias)  # gate
-        self.w2 = nn.Linear(d_model, d_ff, bias=bias)  # value
-        self.w3 = nn.Linear(d_ff, d_model, bias=bias)
+        # Note: true SwiGLU uses d_ff * 2/3 to keep param count equivalent to vanilla FFN
+        # Round to nearest multiple of 64 for CUDA efficiency
+        d_ff_swiglu = int(d_ff * 2 / 3)
+        d_ff_swiglu = (d_ff_swiglu + 63) // 64 * 64   # Round up to multiple of 64
+        self.gate = nn.Linear(d_model, d_ff_swiglu, bias=bias)
+        self.up   = nn.Linear(d_model, d_ff_swiglu, bias=bias)
+        self.down = nn.Linear(d_ff_swiglu, d_model, bias=bias)
 
     def forward(self, x):
-        return self.w3(self.w2(x) * torch.sigmoid(self.w1(x)))
+        # SiLU gate × value projection — the true SwiGLU formula
+        return self.down(torch.nn.functional.silu(self.gate(x)) * self.up(x))
 
 class GeGLU(nn.Module):
     """PaLM-2 / DeepSeek-Coder"""

@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
-from .encoder import EncoderLayer
+from .encoder import EncoderLayer, RMSNorm
 from .decoder import DecoderLayer
 from .embeddings.DiffEmbedding import DiffEmbedding
 
 class Transformer(nn.Module):
-    def __init__(self, src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout):
+    def __init__(self, src_vocab_size, tgt_vocab_size, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout, tie_weights=True):
         super(Transformer, self).__init__()
         
         # Use lean DiffEmbedding for encoder (with change-type signal)
@@ -23,8 +23,18 @@ class Transformer(nn.Module):
         self.encoder_layers = nn.ModuleList([EncoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)])
         self.decoder_layers = nn.ModuleList([DecoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)])
 
-        self.fc = nn.Linear(d_model, tgt_vocab_size)
+        # Final layer norms after all encoder/decoder layers
+        self.encoder_norm = RMSNorm(d_model)
+        self.decoder_norm = RMSNorm(d_model)
+
+        self.fc = nn.Linear(d_model, tgt_vocab_size, bias=False)
         self.dropout = nn.Dropout(dropout)
+        
+        # Weight tying: fc.weight == decoder_embedding.weight
+        # This works because both map between d_model and tgt_vocab_size
+        if tie_weights:
+            self.fc.weight = self.decoder_embedding.weight
+            print("[Model] Decoder embedding and output projection weights are TIED")
 
     def generate_mask(self, src, tgt):
         """
@@ -94,6 +104,8 @@ class Transformer(nn.Module):
                 preserve_rng_state=True,
                 use_reentrant=False
             )
+        # Apply final encoder norm
+        enc_output = self.encoder_norm(enc_output)
         
         # Decoder - simple embedding without positional encoding (RoPE handles it)
         tgt_embedded = self.decoder_embedding(tgt)
@@ -110,5 +122,7 @@ class Transformer(nn.Module):
                 preserve_rng_state=True,
                 use_reentrant=False
             )
+        # Apply final decoder norm
+        dec_output = self.decoder_norm(dec_output)
         
         return self.fc(dec_output)
