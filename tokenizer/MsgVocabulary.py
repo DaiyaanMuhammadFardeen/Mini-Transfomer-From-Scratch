@@ -20,6 +20,57 @@ except ImportError:
     from programming_terms import extract_programming_terms, create_programming_tokens
 
 
+class TrieNode:
+    __slots__ = ('children', 'token_id')
+    def __init__(self):
+        self.children = {}
+        self.token_id = None   # None = not a complete token
+
+class VocabTrie:
+    """
+    Prefix trie built from vocabulary for O(L) max-match tokenization.
+    L = length of the longest matching token.
+    """
+    def __init__(self, stoi: dict):
+        self.root = TrieNode()
+        self.unk_id = stoi.get('<UNK>', 1)
+        # Insert all non-special tokens
+        for word, idx in stoi.items():
+            if word.startswith('<') and word.endswith('>'):
+                continue   # skip special tokens
+            node = self.root
+            for ch in word.lower():
+                if ch not in node.children:
+                    node.children[ch] = TrieNode()
+                node = node.children[ch]
+            node.token_id = idx
+
+    def tokenize(self, text: str) -> list[int]:
+        import re
+        ids = []
+        for word in re.findall(r'\w+|[^\w\s]|\s+', text):
+            word_lower = word.lower()
+            i = 0
+            while i < len(word_lower):
+                node = self.root
+                last_match_end = -1
+                last_match_id  = None
+                j = i
+                while j < len(word_lower) and word_lower[j] in node.children:
+                    node = node.children[word_lower[j]]
+                    j += 1
+                    if node.token_id is not None:
+                        last_match_end = j
+                        last_match_id  = node.token_id
+                if last_match_id is not None:
+                    ids.append(last_match_id)
+                    i = last_match_end
+                else:
+                    ids.append(self.unk_id)
+                    i += 1
+        return ids
+
+
 class MsgVocabulary:
     """
     Enhanced BPE tokenizer that incorporates embedding-specific tokens for commit messages.
@@ -73,6 +124,7 @@ class MsgVocabulary:
 
         self._initialize_special_tokens()
         self.is_trained = False
+        self._trie = None   # Built lazily on first numericalize call
 
         print(f"\033[94m⚡ Enhanced BPE ({self.n_workers} workers) with embedding-aware tokens\033[0m", file=sys.stderr)
 
@@ -772,11 +824,75 @@ class MsgVocabulary:
 
         return tokens
 
+    def max_match_numericalize(self, text: str) -> list[int]:
+        """
+        Word-boundary-aware max-match tokenization.
+        Splits on whitespace/punctuation first, then max-matches within each word.
+        This prevents 'fixindentation' from being matched if 'fixindentation' isn't in vocab.
+        
+        For a word like "indentation", if 'indentation' is in the vocabulary,
+        it will be matched as a single token rather than split into "indent" + "ation".
+        This consistently produces fewer, larger tokens.
+
+        Algorithm:
+            1. Split text into words and separators (preserving order)
+            2. For each word, try exact match first
+            3. If no exact match, use longest-token-first greedy matching
+            4. Separators are handled individually
+        """
+        import re
+        unk_id = self.stoi.get('<UNK>', 1)
+
+        # Cache max token length for efficiency
+        if not hasattr(self, '_max_token_len'):
+            # Exclude special tokens (those wrapped in <>) from length calculation
+            real_tokens = [t for t in self.stoi if not (t.startswith('<') and t.endswith('>'))]
+            self._max_token_len = max((len(t) for t in real_tokens), default=1)
+
+        # Split text into words and non-word separators, preserving order
+        tokens = re.findall(r'\w+|[^\w\s]|\s+', text)
+        ids = []
+
+        for token in tokens:
+            token_lower = token.lower()
+
+            # First, check if the full word is in vocab (exact match, no splitting needed)
+            if token_lower in self.stoi:
+                ids.append(self.stoi[token_lower])
+                continue
+
+            # Otherwise, max-match within this word
+            i = 0
+            while i < len(token_lower):
+                matched = False
+                max_j = min(i + self._max_token_len, len(token_lower))
+                for j in range(max_j, i, -1):
+                    candidate = token_lower[i:j]
+                    if candidate in self.stoi:
+                        ids.append(self.stoi[candidate])
+                        i = j
+                        matched = True
+                        break
+                if not matched:
+                    ids.append(unk_id)
+                    i += 1
+
+        return ids
+
     def numericalize(self, text: str) -> List[int]:
-        """Convert text to indices."""
-        tokens = self.tokenize(text)
-        unk_idx = self.stoi['<UNK>']
-        return [self.stoi.get(token, unk_idx) for token in tokens]
+        """
+        Public tokenization entrypoint.
+        Uses trie-based max-match for O(L) tokenization speed.
+        Falls back to character-level if not trained.
+        """
+        if not self.is_trained or not self.stoi:
+            return [self.stoi.get(c, self.stoi.get('<UNK>', 1)) for c in text.lower()]
+
+        # Build trie lazily on first call
+        if self._trie is None:
+            self._trie = VocabTrie(self.stoi)
+        
+        return self._trie.tokenize(text)
 
     def decode(self, indices: List[int]) -> str:
         """Decode indices to text."""
@@ -816,9 +932,25 @@ class MsgVocabulary:
         vocab.itos = {int(k): v for k, v in data['itos'].items()}
         vocab.special_tokens = data['special_tokens']
         vocab.is_trained = data['is_trained']
+        vocab._trie = None  # Initialize trie lazily
+        ##TODO: Please remove the above line once you hve retrained msgvocab
 
         print(f"\033[92m✅ Loaded (vocab: {len(vocab.stoi):,})\033[0m", file=sys.stderr)
         return vocab
 
     def __len__(self):
         return len(self.stoi)
+
+    def __getstate__(self):
+        """Custom pickle serialization."""
+        state = self.__dict__.copy()
+        # Don't pickle _trie, rebuild it on load
+        state['_trie'] = None
+        return state
+
+    def __setstate__(self, state):
+        """Custom pickle deserialization - ensures _trie exists."""
+        self.__dict__.update(state)
+        # Ensure _trie attribute exists for backward compatibility
+        if '_trie' not in self.__dict__:
+            self._trie = None

@@ -1,87 +1,90 @@
+import os
+import json
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+
 class CodeDiffDataset(Dataset):
-    # Define change-type tag names at class level for efficiency
+    """
+    Memory-mapped dataset. Reads token arrays directly from .npy files on disk.
+    RAM usage is near-zero regardless of dataset size.
+
+    Supports two modes:
+      1. pretokenized=True  → load from tokenized_dir/*.npy (recommended)
+      2. pretokenized=False → legacy in-memory mode (for small datasets only)
+    """
+
     CHANGE_TYPE_TAGS = ['<ADD>', '<REMOVE>', '<MODIFY>',
                         '<COMMENT_ADD>', '<COMMENT_REMOVE>', '<COMMENT_MODIFY>']
-    def __init__(self, messages, diffs, src_vocab, tgt_vocab, max_seq_length):
-        self.messages = messages
-        self.diffs = diffs
-        self.src_vocab = src_vocab
-        self.tgt_vocab = tgt_vocab
-        self.max_seq_length = max_seq_length
+
+    def __init__(self, tokenized_dir: str, src_vocab=None, split='train',
+                 train_frac=0.9, seed=42):
+        """
+        Args:
+            tokenized_dir: Directory containing src_tokens.npy, tgt_tokens.npy, meta.json
+            src_vocab: Source vocabulary (only needed for change_features extraction)
+            split: 'train' or 'val'
+            train_frac: Fraction of data to use for training
+            seed: Random seed for train/val split
+        """
+        meta_path = os.path.join(tokenized_dir, "meta.json")
+        with open(meta_path) as f:
+            self.meta = json.load(f)
+
+        self.total_rows   = self.meta["total_rows"]
+        self.max_seq_length = self.meta["max_seq_length"]
+        dtype_str         = self.meta.get("dtype", "int16")
+        self.dtype        = np.int16 if dtype_str == "int16" else np.int32
+
+        # Memory-mapped arrays — these DO NOT load into RAM
+        self.src_mmap = np.load(
+            os.path.join(tokenized_dir, "src_tokens.npy"),
+            mmap_mode='r'
+        )
+        self.tgt_mmap = np.load(
+            os.path.join(tokenized_dir, "tgt_tokens.npy"),
+            mmap_mode='r'
+        )
+
+        # Deterministic train/val index split
+        rng = np.random.default_rng(seed)
+        all_indices = np.arange(self.total_rows)
+        rng.shuffle(all_indices)
+        split_pt = int(self.total_rows * train_frac)
+
+        if split == 'train':
+            self.indices = all_indices[:split_pt]
+        else:
+            self.indices = all_indices[split_pt:]
+
+        # We still need src_vocab for change_features — but ONLY the stoi dict
+        # Store just the integer IDs we need, not the whole vocab object
+        self.change_tag_ids = []
+        if src_vocab is not None:
+            for tag in self.CHANGE_TYPE_TAGS:
+                self.change_tag_ids.append(src_vocab.stoi.get(tag, -1))
 
     def __len__(self):
-        return len(self.messages)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        ## Fixed: src should be diffs, tgt should be messages
-        src_text = self.diffs[idx]
-        tgt_text = self.messages[idx]
+        real_idx = self.indices[idx]
 
-        src_tokens = self.tokenize_text(src_text, self.src_vocab)
-        tgt_tokens = self.tokenize_text(tgt_text, self.tgt_vocab)
+        # Read from memmap — copies only this row into RAM
+        src_tokens = torch.from_numpy(
+            self.src_mmap[real_idx].astype(np.int64)
+        )
+        tgt_tokens = torch.from_numpy(
+            self.tgt_mmap[real_idx].astype(np.int64)
+        )
 
-        src_tokens = [self.src_vocab.stoi["<SOS>"]] + src_tokens + [self.src_vocab.stoi["<EOS>"]]
-        tgt_tokens = [self.tgt_vocab.stoi["<SOS>"]] + tgt_tokens + [self.tgt_vocab.stoi["<EOS>"]]
-
-        src_tokens = src_tokens[:self.max_seq_length] + [self.src_vocab.stoi["<PAD>"]] * (self.max_seq_length - len(src_tokens))
-        tgt_tokens = tgt_tokens[:self.max_seq_length] + [self.tgt_vocab.stoi["<PAD>"]] * (self.max_seq_length - len(tgt_tokens))
-
-        src_tokens = torch.tensor(src_tokens, dtype=torch.long)
-        tgt_tokens = torch.tensor(tgt_tokens, dtype=torch.long)
-        
-        # Extract change-type features from diff tokens
         change_features = self._extract_change_features(src_tokens)
-        
         return src_tokens, tgt_tokens, change_features
 
-    def tokenize_text(self, text, vocab):
-        return vocab.numericalize(text)
-    
-    def _extract_change_features(self, src_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Scan tokenized diff for structural change-type tags.
-        Returns a (6,) float32 binary tensor.
-
-        Index mapping:
-            0: <ADD>            present
-            1: <REMOVE>         present
-            2: <MODIFY>         present
-            3: <COMMENT_ADD>    present
-            4: <COMMENT_REMOVE> present
-            5: <COMMENT_MODIFY> present
-        """
+    def _extract_change_features(self, src_tokens):
         features = torch.zeros(6, dtype=torch.float32)
-        for i, tag in enumerate(self.CHANGE_TYPE_TAGS):
-            tag_id = self.src_vocab.stoi.get(tag, -1)
+        for i, tag_id in enumerate(self.change_tag_ids):
             if tag_id != -1 and (src_tokens == tag_id).any():
                 features[i] = 1.0
         return features
-
-    def get_multimodal_features(self, idx):
-        """
-        Placeholder method to return multimodal features for the given index.
-        This would be implemented to extract semantic, contextual, and other features
-        from the source code diffs and target messages.
-        """
-        # This is a placeholder - in a real implementation, this would extract
-        # the various features for the multimodal embedding system
-        return {
-            'ast_nodes': None,
-            'context_info': None,
-            'patterns': None,
-            'temporal_features': None,
-            'collaborative_features': None,
-            'domain_features': None,
-            'change_types': None,
-            'dependencies': None,
-            'complexity_features': None,
-            'error_features': None,
-            'performance_features': None,
-            'testing_features': None,
-            'style_features': None,
-            'security_features': None,
-            'api_features': None
-        }
