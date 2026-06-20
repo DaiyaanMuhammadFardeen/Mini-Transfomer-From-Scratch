@@ -45,6 +45,7 @@ class QuickSaver:
         self.keep_last_n     = keep_last_n
         self._lock           = threading.Lock()
         self._pending_save   = False
+        self.last_saved_step = 0          # tracks when we last saved
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         # Hook signals — fires even on power-loss-like conditions
@@ -61,6 +62,10 @@ class QuickSaver:
         if self._last_state is not None:
             self._write_checkpoint(self._last_state, emergency=True)
         raise SystemExit(0)
+
+    def restore_state(self, last_saved_step: int):
+        """Call this after loading a checkpoint to sync internal counter."""
+        self.last_saved_step = last_saved_step
 
     def step(self, global_step: int, epoch: int, model, optimizer,
              scheduler=None, scaler=None, val_loss=None,
@@ -86,8 +91,10 @@ class QuickSaver:
         # Always keep last state for signal handler
         self._last_state = state
 
-        if global_step % self.save_every_steps == 0 and global_step > 0:
+        # Use subtraction-based check (more robust than modulo after resume)
+        if global_step - self.last_saved_step >= self.save_every_steps and global_step > 0:
             self._write_checkpoint(state, emergency=False)
+            self.last_saved_step = global_step
 
     def save_epoch(self, epoch: int, model, optimizer, val_loss: float,
                    best_val_loss: float, scheduler=None, scaler=None,
@@ -118,6 +125,10 @@ class QuickSaver:
             step = state['global_step']
             prefix = "emergency" if emergency else f"step_{step:08d}"
             path = os.path.join(self.checkpoint_dir, f"{prefix}.pth")
+            
+            # Add saver's internal state to checkpoint
+            state['saver_last_saved_step'] = self.last_saved_step
+            
             self._atomic_save(state, path)
             if not emergency:
                 self._cleanup_old(prefix="step_")

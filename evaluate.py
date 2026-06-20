@@ -15,6 +15,19 @@ from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
+# Import search algorithms for benchmark evaluation
+from search_algorithms import (
+    greedy_search,
+    beam_search,
+    top_k_sampling,
+    top_p_sampling,
+    diverse_beam_search,
+    contrastive_search,
+    typical_sampling,
+    min_p_sampling,
+    temperature_sampling,
+)
+
 # Set working directory
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,6 +104,97 @@ def load_vocabularies(diff_vocab_path, message_vocab_path):
     return src_vocab, tgt_vocab
 
 
+def batch_greedy_generate(model, diff_texts, src_vocab, tgt_vocab, device,
+                           max_seq_length, max_gen_length=50, batch_size=32):
+    """
+    Generate commit messages for a batch of diffs in parallel.
+    Fully utilizes GPU by running encoder + decoder on whole batches.
+
+    Args:
+        model:           Trained transformer
+        diff_texts:      List of diff strings (length = batch_size)
+        src_vocab:       Source vocabulary
+        tgt_vocab:       Target vocabulary
+        device:          torch.device
+        max_seq_length:  Encoder input length
+        max_gen_length:  Max tokens to generate
+        batch_size:      How many samples per GPU batch
+
+    Returns:
+        List of generated strings (same length as diff_texts)
+    """
+    sos_id = tgt_vocab.stoi["<SOS>"]
+    eos_id  = tgt_vocab.stoi["<EOS>"]
+    pad_id  = tgt_vocab.stoi["<PAD>"]
+
+    all_predictions = []
+
+    for batch_start in range(0, len(diff_texts), batch_size):
+        batch_texts = diff_texts[batch_start : batch_start + batch_size]
+        B = len(batch_texts)
+
+        # Tokenise & pad all sources
+        src_ids_list = [
+            tokenize_and_pad(t, src_vocab, max_seq_length) for t in batch_texts
+        ]
+        src_tensor = torch.tensor(src_ids_list, dtype=torch.long).to(device)  # (B, S)
+
+        # Change-type features
+        change_feats = torch.stack([
+            extract_change_features(ids, src_vocab) for ids in src_ids_list
+        ]).to(device)  # (B, 6)
+
+        with torch.no_grad():
+            # Encode once
+            src_mask, _ = model.generate_mask(src_tensor, src_tensor)
+            src_emb     = model.dropout(model.encoder_embedding(src_tensor, change_feats))
+            enc_output  = src_emb
+            for layer in model.encoder_layers:
+                enc_output = layer(enc_output, src_mask)
+            enc_output = model.encoder_norm(enc_output)          # (B, S, D)
+
+            # Decode step-by-step for all samples in parallel
+            # tgt_seqs: current decoder input for each sample  (B, T)
+            tgt_seqs  = torch.full((B, 1), sos_id, dtype=torch.long, device=device)
+            done_mask = torch.zeros(B, dtype=torch.bool, device=device)  # True when EOS hit
+
+            for _ in range(max_gen_length):
+                _, tgt_mask = model.generate_mask(src_tensor, tgt_seqs)
+
+                tgt_emb    = model.dropout(model.decoder_embedding(tgt_seqs))
+                dec_output = tgt_emb
+                for layer in model.decoder_layers:
+                    dec_output = layer(dec_output, enc_output, src_mask, tgt_mask)
+                dec_output = model.decoder_norm(dec_output)
+
+                # Greedy: argmax over last token position
+                logits     = model.fc(dec_output[:, -1, :])   # (B, V)
+                next_token = logits.argmax(dim=-1)              # (B,)
+
+                # Force PAD for already-finished sequences
+                next_token = next_token.masked_fill(done_mask, pad_id)
+
+                tgt_seqs  = torch.cat([tgt_seqs, next_token.unsqueeze(1)], dim=1)
+                done_mask = done_mask | (next_token == eos_id)
+
+                if done_mask.all():
+                    break
+
+        # Decode token IDs -> strings
+        for i in range(B):
+            tokens = []
+            for tok_id in tgt_seqs[i, 1:].tolist():   # skip SOS
+                if tok_id == eos_id:
+                    break
+                if tok_id == pad_id:
+                    continue
+                if tok_id in tgt_vocab.itos:
+                    tokens.append(tgt_vocab.itos[tok_id])
+            all_predictions.append(" ".join(tokens))
+
+    return all_predictions
+
+
 def load_model(checkpoint_path, src_vocab_size, tgt_vocab_size, device, args):
     """Load model from checkpoint."""
     print_step("Loading model...")
@@ -98,7 +202,26 @@ def load_model(checkpoint_path, src_vocab_size, tgt_vocab_size, device, args):
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Build model first
+    # Check if checkpoint has vocab size info or adjust based on checkpoint shape
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+    
+    # Extract actual vocab sizes from checkpoint if they differ
+    if 'decoder_embedding.weight' in state_dict:
+        checkpoint_tgt_vocab_size = state_dict['decoder_embedding.weight'].shape[0]
+        if checkpoint_tgt_vocab_size != tgt_vocab_size:
+            print_info(f"Adjusting target vocab size: {tgt_vocab_size} -> {checkpoint_tgt_vocab_size}")
+            tgt_vocab_size = checkpoint_tgt_vocab_size
+    
+    if 'encoder_embedding.weight' in state_dict:
+        checkpoint_src_vocab_size = state_dict['encoder_embedding.weight'].shape[0]
+        if checkpoint_src_vocab_size != src_vocab_size:
+            print_info(f"Adjusting source vocab size: {src_vocab_size} -> {checkpoint_src_vocab_size}")
+            src_vocab_size = checkpoint_src_vocab_size
+    
+    # Build model with corrected vocab sizes
     model = Transformer(
         src_vocab_size=src_vocab_size,
         tgt_vocab_size=tgt_vocab_size,
@@ -127,6 +250,12 @@ def load_model(checkpoint_path, src_vocab_size, tgt_vocab_size, device, args):
         model.load_state_dict(checkpoint)
     
     model.eval()
+    
+    # Compile the model (PyTorch 2.0+) — gives 20–40% speedup on modern GPUs
+    if hasattr(torch, 'compile'):
+        print_info("Compiling model with torch.compile...")
+        model = torch.compile(model, mode="reduce-overhead")
+        print_success("Model compiled")
     
     num_params = sum(p.numel() for p in model.parameters())
     print_info(f"Model parameters: {num_params:,}")
@@ -158,6 +287,35 @@ def tokenize_and_pad(text, vocab, max_length):
     ids = ids + [pad_id] * (max_length - len(ids))
     
     return ids[:max_length]
+
+
+def extract_change_features(token_ids, src_vocab):
+    """
+    Extract 6-dimensional change-type features from token IDs.
+    Matches the logic in CodeDiffDataset._extract_change_features.
+    
+    Args:
+        token_ids: List or tensor of token IDs
+        src_vocab: Source vocabulary with stoi mapping
+        
+    Returns:
+        torch.Tensor of shape (6,) with binary flags
+    """
+    CHANGE_TYPE_TAGS = ['<ADD>', '<REMOVE>', '<MODIFY>',
+                        '<COMMENT_ADD>', '<COMMENT_REMOVE>', '<COMMENT_MODIFY>']
+    
+    features = torch.zeros(6, dtype=torch.float32)
+    
+    # Convert to tensor if needed
+    if not isinstance(token_ids, torch.Tensor):
+        token_ids = torch.tensor(token_ids)
+    
+    for i, tag in enumerate(CHANGE_TYPE_TAGS):
+        tag_id = src_vocab.stoi.get(tag, -1)
+        if tag_id != -1 and (token_ids == tag_id).any():
+            features[i] = 1.0
+    
+    return features
 
 
 def ngram_repetition_penalty(logits, generated_tokens, n=2, penalty=1.0):
@@ -305,6 +463,9 @@ def diversity_beam_search_generate(model, diff_text, src_vocab, tgt_vocab, devic
     src_ids = tokenize_and_pad(diff_text, src_vocab, max_seq_length)
     src_tensor = torch.tensor([src_ids], dtype=torch.long).to(device)
     
+    # Extract change features
+    change_features = extract_change_features(src_ids, src_vocab).unsqueeze(0).to(device)
+    
     # Special tokens
     sos_id = tgt_vocab.stoi["<SOS>"]
     eos_id = tgt_vocab.stoi["<EOS>"]
@@ -322,10 +483,12 @@ def diversity_beam_search_generate(model, diff_text, src_vocab, tgt_vocab, devic
     with torch.no_grad():
         # Get encoder output once
         src_mask, _ = model.generate_mask(src_tensor, src_tensor)
-        src_embedded = model.dropout(model.encoder_embedding(src_tensor))
+        src_embedded = model.dropout(model.encoder_embedding(src_tensor, change_features))
         enc_output = src_embedded
         for enc_layer in model.encoder_layers:
             enc_output = enc_layer(enc_output, src_mask)
+        # Apply final encoder norm
+        enc_output = model.encoder_norm(enc_output)
     
     for gen_step in range(max_gen_length):
         candidates = []
@@ -343,6 +506,8 @@ def diversity_beam_search_generate(model, diff_text, src_vocab, tgt_vocab, devic
                 dec_output = tgt_embedded
                 for dec_layer in model.decoder_layers:
                     dec_output = dec_layer(dec_output, enc_output, src_mask, tgt_mask)
+                # Apply final decoder norm
+                dec_output = model.decoder_norm(dec_output)
                 
                 # Get logits for last position
                 logits = model.fc(dec_output[:, -1, :])
@@ -462,6 +627,9 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
     src_ids = tokenize_and_pad(diff_text, src_vocab, max_seq_length)
     src_tensor = torch.tensor([src_ids], dtype=torch.long).to(device)
     
+    # Extract change features
+    change_features = extract_change_features(src_ids, src_vocab).unsqueeze(0).to(device)
+    
     # Special tokens
     sos_id = tgt_vocab.stoi["<SOS>"]
     eos_id = tgt_vocab.stoi["<EOS>"]
@@ -479,11 +647,13 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
     with torch.no_grad():
         # Get encoder output once
         src_mask, _ = model.generate_mask(src_tensor, src_tensor)
-        src_embedded = model.encoder_embedding(src_tensor, None)  # No change_features during inference
+        src_embedded = model.encoder_embedding(src_tensor, change_features)
         src_embedded = model.dropout(src_embedded)
         enc_output = src_embedded
         for enc_layer in model.encoder_layers:
             enc_output = enc_layer(enc_output, src_mask)
+        # Apply final encoder norm
+        enc_output = model.encoder_norm(enc_output)
     
     for gen_step in range(max_gen_length):
         candidates = []
@@ -498,12 +668,13 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
                 
                 # Forward pass through decoder
                 batch_size, tgt_seq_len = tgt_tensor.shape
-                positions = torch.arange(tgt_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-                tgt_embedded = model.decoder_embedding(tgt_tensor) + model.decoder_positional(positions)
+                tgt_embedded = model.decoder_embedding(tgt_tensor)
                 dec_output = model.dropout(tgt_embedded)
                 
                 for dec_layer in model.decoder_layers:
                     dec_output = dec_layer(dec_output, enc_output, src_mask, tgt_mask)
+                # Apply final decoder norm
+                dec_output = model.decoder_norm(dec_output)
                 
                 # Get logits for last position only
                 logits = model.fc(dec_output[:, -1, :])
@@ -583,6 +754,27 @@ def beam_search_generate(model, diff_text, src_vocab, tgt_vocab, device,
 
 
 # ============================================================================
+# SEARCH ALGORITHM REGISTRY FOR BENCHMARK EVALUATION
+# ============================================================================
+
+ALGORITHM_REGISTRY = {
+    "greedy":            lambda m, d, sv, tv, dev, msl: greedy_search(m, d, sv, tv, dev, msl, max_gen_length=50),
+    "beam_search_k5":    lambda m, d, sv, tv, dev, msl: beam_search(m, d, sv, tv, dev, msl, max_gen_length=50, beam_width=5, length_penalty=1.0),
+    "beam_search_k3":    lambda m, d, sv, tv, dev, msl: beam_search(m, d, sv, tv, dev, msl, max_gen_length=50, beam_width=3, length_penalty=1.0),
+    "top_k_50":          lambda m, d, sv, tv, dev, msl: top_k_sampling(m, d, sv, tv, dev, msl, max_gen_length=50, k=50, temperature=0.8),
+    "top_k_20":          lambda m, d, sv, tv, dev, msl: top_k_sampling(m, d, sv, tv, dev, msl, max_gen_length=50, k=20, temperature=0.8),
+    "top_p_0.9":         lambda m, d, sv, tv, dev, msl: top_p_sampling(m, d, sv, tv, dev, msl, max_gen_length=50, p=0.9, temperature=0.8),
+    "top_p_0.95":        lambda m, d, sv, tv, dev, msl: top_p_sampling(m, d, sv, tv, dev, msl, max_gen_length=50, p=0.95, temperature=0.8),
+    "temperature_0.7":   lambda m, d, sv, tv, dev, msl: temperature_sampling(m, d, sv, tv, dev, msl, max_gen_length=50, temperature=0.7),
+    "temperature_1.0":   lambda m, d, sv, tv, dev, msl: temperature_sampling(m, d, sv, tv, dev, msl, max_gen_length=50, temperature=1.0),
+    "diverse_beam":      lambda m, d, sv, tv, dev, msl: diverse_beam_search(m, d, sv, tv, dev, msl, max_gen_length=50, beam_width=6, group_beam_width=2, diversity_penalty=0.5),
+    "contrastive_approx":lambda m, d, sv, tv, dev, msl: contrastive_search(m, d, sv, tv, dev, msl, max_gen_length=50, penalty_alpha=0.6, top_k=4),
+    "typical_tau0.9":    lambda m, d, sv, tv, dev, msl: typical_sampling(m, d, sv, tv, dev, msl, max_gen_length=50, tau=0.9, temperature=0.8),
+    "min_p_0.05":        lambda m, d, sv, tv, dev, msl: min_p_sampling(m, d, sv, tv, dev, msl, max_gen_length=50, min_p=0.05, temperature=0.8),
+}
+
+
+# ============================================================================
 # EVALUATION METRICS - SOTA for Commit Message Generation
 # ============================================================================
 
@@ -637,10 +829,12 @@ def compute_meteor(references: list, hypotheses: list) -> float:
         # Download required data if not present
         try:
             nltk.data.find('corpora/wordnet')
+            nltk.data.find('corpora/omw-1.4')
         except LookupError:
             print_info("Downloading WordNet for METEOR...")
             nltk.download('wordnet', quiet=True)
             nltk.download('omw-1.4', quiet=True)
+            print_success("WordNet downloaded successfully")
         
         scores = []
         for ref, hyp in zip(references, hypotheses):
@@ -922,6 +1116,146 @@ def save_metrics_report(metrics: dict, output_path: str):
     print_success(f"Metrics report saved to {output_path}")
 
 
+def run_benchmark(args):
+    """
+    Run comprehensive benchmark across all search algorithms.
+    Produces two CSV files: predictions_all_algorithms.csv and benchmark_summary.csv
+    """
+    print_header("COMPREHENSIVE SEARCH ALGORITHM BENCHMARK")
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print_info(f"Device: {device}")
+    
+    # Step 1: Load data, vocabularies, model
+    print_step("Loading evaluation data...")
+    df = pd.read_parquet(args.data_path)
+    # Use larger sample for reliable statistics (fixed n=500)
+    df = df.sample(n=250, random_state=42)
+    print_info(f"Loaded {len(df):,} samples for benchmark")
+    print_success("Data loaded")
+    
+    # Load vocabularies
+    src_vocab, tgt_vocab = load_vocabularies(args.diff_vocab_path, args.message_vocab_path)
+    src_vocab_size = len(src_vocab.stoi)
+    tgt_vocab_size = len(tgt_vocab.stoi)
+    
+    # Load model
+    model = load_model(args.checkpoint, src_vocab_size, tgt_vocab_size, device, args)
+    
+    max_seq_length = args.max_seq_length
+    
+    # Step 3: Outer loop over samples, inner loop over algorithms
+    print_step(f"Running benchmark across {len(ALGORITHM_REGISTRY)} algorithms...")
+    rows = []
+    
+    total_iterations = len(df) * len(ALGORITHM_REGISTRY)
+    iteration_count = 0
+    
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Benchmarking samples"):
+        diff_text = row['diff_text'] if not pd.isna(row['diff_text']) else ""
+        ref_message = row['message'] if not pd.isna(row['message']) else ""
+        
+        for algo_name, algo_fn in ALGORITHM_REGISTRY.items():
+            iteration_count += 1
+            
+            try:
+                gen_message, gen_time = algo_fn(
+                    model, diff_text, src_vocab, tgt_vocab, device, max_seq_length
+                )
+            except Exception as e:
+                print_warning(f"Error with {algo_name} on sample {idx}: {e}")
+                gen_message, gen_time = "", 0.0
+            
+            # Per-sample metrics (sentence-level)
+            if gen_message.strip():
+                bleu = compute_bleu([ref_message], [gen_message])
+                meteor = compute_meteor([ref_message], [gen_message])
+                rouge = compute_rouge_l([ref_message], [gen_message])
+                exact = int(ref_message.strip().lower() == gen_message.strip().lower())
+            else:
+                bleu = 0.0
+                meteor = 0.0
+                rouge = {"rouge_l_f": 0.0}
+                exact = 0
+            
+            rows.append({
+                "sample_id":         idx,
+                "diff_text":         diff_text[:200],
+                "reference_message": ref_message,
+                "algorithm":         algo_name,
+                "generated_message": gen_message,
+                "bleu_4":            bleu,
+                "meteor":            meteor,
+                "rouge_l_f":         rouge["rouge_l_f"],
+                "exact_match":       exact,
+                "gen_time_ms":       gen_time * 1000,  # Convert to milliseconds
+                "output_length":     len(gen_message.split()) if gen_message else 0,
+            })
+    
+    # Step 4: Save predictions CSV
+    print_step("Saving detailed predictions...")
+    df_pred = pd.DataFrame(rows)
+    df_pred.to_csv("predictions_all_algorithms.csv", index=False)
+    print_success(f"Saved {len(df_pred):,} prediction rows to predictions_all_algorithms.csv")
+    
+    # Step 5: Compute corpus-level BLEU and aggregate statistics per algorithm
+    print_step("Computing aggregate statistics...")
+    summary_rows = []
+    
+    for algo_name, group in df_pred.groupby("algorithm"):
+        refs = group["reference_message"].tolist()
+        hyps = group["generated_message"].tolist()
+        
+        # Corpus-level BLEU (not averaged sentence BLEU)
+        corpus_bleu_score = compute_bleu(refs, hyps)
+        
+        # Mean metrics
+        mean_meteor = group["meteor"].mean()
+        mean_rouge = group["rouge_l_f"].mean()
+        exact_match_pct = group["exact_match"].mean() * 100
+        
+        # Generation time statistics
+        times = group["gen_time_ms"]
+        mean_gen_time = times.mean()
+        p50_gen_time = times.quantile(0.50)
+        p95_gen_time = times.quantile(0.95)
+        
+        # Output length and empty count
+        mean_output_len = group["output_length"].mean()
+        n_empty = int((group["generated_message"].str.strip() == "").sum())
+        n_samples = len(group)
+        
+        summary_rows.append({
+            "algorithm":        algo_name,
+            "corpus_bleu_4":    corpus_bleu_score,
+            "mean_meteor":      mean_meteor,
+            "mean_rouge_l_f":   mean_rouge,
+            "exact_match_pct":  exact_match_pct,
+            "mean_gen_time_ms": mean_gen_time,
+            "p50_gen_time_ms":  p50_gen_time,
+            "p95_gen_time_ms":  p95_gen_time,
+            "mean_output_len":  mean_output_len,
+            "n_empty":          n_empty,
+            "n_samples":        n_samples,
+        })
+    
+    # Create summary dataframe sorted by BLEU-4
+    df_summary = pd.DataFrame(summary_rows).sort_values("corpus_bleu_4", ascending=False)
+    
+    # Step 6: Save summary CSV and print table
+    df_summary.to_csv("benchmark_summary.csv", index=False)
+    print_success("Saved benchmark_summary.csv")
+    
+    # Print summary table to terminal
+    print_header("BENCHMARK SUMMARY TABLE")
+    print(df_summary.to_string(index=False))
+    
+    print_header("BENCHMARK COMPLETE")
+    print_info(f"Detailed predictions: predictions_all_algorithms.csv")
+    print_info(f"Aggregate summary: benchmark_summary.csv")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Transformer model for commit message generation")
     parser.add_argument("--data-path", default="./val_data.parquet", help="Path to parquet file")
@@ -942,8 +1276,129 @@ def main():
     parser.add_argument("--num-layers", type=int, default=4, help="Number of transformer layers")
     parser.add_argument("--d-ff", type=int, default=2048, help="Feed-forward dimension")
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
+    parser.add_argument("--algorithm", type=str, default="beam_search_k5", 
+                        choices=list(ALGORITHM_REGISTRY.keys()),
+                        help=f"Search algorithm to use. Available: {', '.join(ALGORITHM_REGISTRY.keys())}")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Run all search algorithms and produce benchmark CSVs")
     
     args = parser.parse_args()
+    
+    # If benchmark mode, run comprehensive evaluation
+    if args.benchmark:
+        # Set seed for reproducibility with stochastic algorithms
+        torch.manual_seed(42)
+        
+        print_header("COMPREHENSIVE SEARCH ALGORITHM BENCHMARK")
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print_info(f"Device: {device}")
+        
+        print_step("Loading evaluation data...")
+        df = pd.read_parquet(args.data_path)
+        df = df.sample(n=250, random_state=42)
+        print_info(f"Loaded {len(df):,} samples for benchmark")
+        print_success("Data loaded")
+        
+        src_vocab, tgt_vocab = load_vocabularies(args.diff_vocab_path, args.message_vocab_path)
+        src_vocab_size = len(src_vocab.stoi)
+        tgt_vocab_size = len(tgt_vocab.stoi)
+        
+        model = load_model(args.checkpoint, src_vocab_size, tgt_vocab_size, device, args)
+        max_seq_length = args.max_seq_length
+        
+        print_step(f"Running benchmark across {len(ALGORITHM_REGISTRY)} algorithms...")
+        rows = []
+        
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Benchmarking samples"):
+            diff_text = row['diff_text'] if not pd.isna(row['diff_text']) else ""
+            ref_message = row['message'] if not pd.isna(row['message']) else ""
+            
+            for algo_name, algo_fn in ALGORITHM_REGISTRY.items():
+                try:
+                    gen_message, gen_time = algo_fn(
+                        model, diff_text, src_vocab, tgt_vocab, device, max_seq_length
+                    )
+                except Exception as e:
+                    print_warning(f"Error with {algo_name} on sample {idx}: {e}")
+                    gen_message, gen_time = "", 0.0
+                
+                if gen_message.strip():
+                    bleu = compute_bleu([ref_message], [gen_message])
+                    meteor = compute_meteor([ref_message], [gen_message])
+                    rouge = compute_rouge_l([ref_message], [gen_message])
+                    exact = int(ref_message.strip().lower() == gen_message.strip().lower())
+                else:
+                    bleu = 0.0
+                    meteor = 0.0
+                    rouge = {"rouge_l_f": 0.0}
+                    exact = 0
+                
+                rows.append({
+                    "sample_id":         idx,
+                    "diff_text":         diff_text[:200],
+                    "reference_message": ref_message,
+                    "algorithm":         algo_name,
+                    "generated_message": gen_message,
+                    "bleu_4":            bleu,
+                    "meteor":            meteor,
+                    "rouge_l_f":         rouge["rouge_l_f"],
+                    "exact_match":       exact,
+                    "gen_time_ms":       gen_time * 1000,
+                    "output_length":     len(gen_message.split()) if gen_message else 0,
+                })
+        
+        print_step("Saving detailed predictions...")
+        df_pred = pd.DataFrame(rows)
+        df_pred.to_csv("predictions_all_algorithms.csv", index=False)
+        print_success(f"Saved {len(df_pred):,} prediction rows to predictions_all_algorithms.csv")
+        
+        print_step("Computing aggregate statistics...")
+        summary_rows = []
+        
+        for algo_name, group in df_pred.groupby("algorithm"):
+            refs = group["reference_message"].tolist()
+            hyps = group["generated_message"].tolist()
+            
+            corpus_bleu_score = compute_bleu(refs, hyps)
+            mean_meteor = group["meteor"].mean()
+            mean_rouge = group["rouge_l_f"].mean()
+            exact_match_pct = group["exact_match"].mean() * 100
+            
+            times = group["gen_time_ms"]
+            mean_gen_time = times.mean()
+            p50_gen_time = times.quantile(0.50)
+            p95_gen_time = times.quantile(0.95)
+            
+            mean_output_len = group["output_length"].mean()
+            n_empty = int((group["generated_message"].str.strip() == "").sum())
+            n_samples = len(group)
+            
+            summary_rows.append({
+                "algorithm":        algo_name,
+                "corpus_bleu_4":    corpus_bleu_score,
+                "mean_meteor":      mean_meteor,
+                "mean_rouge_l_f":   mean_rouge,
+                "exact_match_pct":  exact_match_pct,
+                "mean_gen_time_ms": mean_gen_time,
+                "p50_gen_time_ms":  p50_gen_time,
+                "p95_gen_time_ms":  p95_gen_time,
+                "mean_output_len":  mean_output_len,
+                "n_empty":          n_empty,
+                "n_samples":        n_samples,
+            })
+        
+        df_summary = pd.DataFrame(summary_rows).sort_values("corpus_bleu_4", ascending=False)
+        df_summary.to_csv("benchmark_summary.csv", index=False)
+        print_success("Saved benchmark_summary.csv")
+        
+        print_header("BENCHMARK SUMMARY TABLE")
+        print(df_summary.to_string(index=False))
+        
+        print_header("BENCHMARK COMPLETE")
+        print_info(f"Detailed predictions: predictions_all_algorithms.csv")
+        print_info(f"Aggregate summary: benchmark_summary.csv")
+        return
     
     print_header("COMMIT MESSAGE GENERATION EVALUATION")
     
@@ -954,7 +1409,7 @@ def main():
     # Load data
     print_step("Loading data...")
     df = pd.read_parquet(args.data_path)
-    df = df.sample(frac=0.0002, random_state=42) # random_state for reproducibility
+    df = df.sample(n=250, random_state=42)  # Fixed n=500 for consistent evaluation
     print_info(f"Loaded {len(df):,} samples")
     print_success("Data loaded")
     
@@ -966,35 +1421,73 @@ def main():
     # Load model
     model = load_model(args.checkpoint, src_vocab_size, tgt_vocab_size, device, args)
     
-    # Generate predictions
-    print_step("Generating predictions...")
-    predictions = []
+    # Get selected algorithm from registry
+    if args.algorithm not in ALGORITHM_REGISTRY:
+        print_error(f"Unknown algorithm: {args.algorithm}")
+        print_info(f"Available algorithms: {', '.join(ALGORITHM_REGISTRY.keys())}")
+        sys.exit(1)
     
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Generating"):
-        diff_text = row['diff_text'] if not pd.isna(row['diff_text']) else ""
+    algorithm_fn = ALGORITHM_REGISTRY[args.algorithm]
+    print_info(f"Using algorithm: {args.algorithm}")
+    
+    # Generate predictions using batched generation for greedy algorithms
+    # For non-greedy algorithms (beam search, etc.), use per-sample loop
+    BATCH_SIZE = 768  # Tune this — increase until VRAM is ~90% full
+    
+    if args.algorithm == "greedy":
+        # Batched generation for maximum GPU utilization
+        diff_texts = [
+            row['diff_text'] if not pd.isna(row['diff_text']) else ""
+            for _, row in df.iterrows()
+        ]
         
-        try:
-            if args.use_mmr or args.repetition_penalty != 1.0:
-                pred = diversity_beam_search_generate(
-                    model, diff_text, src_vocab, tgt_vocab, device,
-                    args.max_seq_length, args.max_gen_length, args.beam_width,
-                    args.length_penalty, args.repetition_penalty, args.ngram_size,
-                    args.use_mmr, args.mmr_lambda, debug=False
-                )
-            else:
-                pred = beam_search_generate(
-                    model, diff_text, src_vocab, tgt_vocab, device,
-                    args.max_seq_length, args.max_gen_length, args.beam_width,
-                    args.length_penalty, debug=False
-                )
+        print_step(f"Generating {len(diff_texts)} predictions (batch_size={BATCH_SIZE})...")
+        import time
+        t0 = time.time()
+        
+        predictions = batch_greedy_generate(
+            model, diff_texts, src_vocab, tgt_vocab, device,
+            max_seq_length=args.max_seq_length,
+            max_gen_length=args.max_gen_length,
+            batch_size=BATCH_SIZE,
+        )
+        
+        total_time = time.time() - t0
+        generation_times = [total_time / len(predictions)] * len(predictions)  # approximate per-sample
+        print_success(f"Generated {len(predictions)} predictions in {total_time:.1f}s "
+                      f"({total_time/len(predictions)*1000:.1f} ms/sample)")
+    else:
+        # Per-sample generation for beam search and other algorithms
+        print_step("Generating predictions...")
+        predictions = []
+        generation_times = []
+        
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc=f"Generating ({args.algorithm})"):
+            diff_text = row['diff_text'] if not pd.isna(row['diff_text']) else ""
             
-            predictions.append(pred)
-        except Exception as e:
-            print_warning(f"Error generating for row {idx}: {e}")
-            predictions.append("")
+            try:
+                pred, gen_time = algorithm_fn(
+                    model, diff_text, src_vocab, tgt_vocab, device, args.max_seq_length
+                )
+                
+                predictions.append(pred)
+                generation_times.append(gen_time)
+            except Exception as e:
+                print_warning(f"Error generating for row {idx}: {e}")
+                predictions.append("")
+                generation_times.append(0.0)
 
-    # Add predictions to dataframe
+    # Add predictions and generation times to dataframe
     df['predicted_message'] = predictions
+    df['generation_time'] = generation_times
+    
+    # Print generation time statistics
+    valid_times = [t for t in generation_times if t > 0]
+    if valid_times:
+        avg_time = sum(valid_times) / len(valid_times)
+        total_time = sum(valid_times)
+        print_info(f"Average generation time: {avg_time:.3f}s per sample")
+        print_info(f"Total generation time: {total_time:.1f}s for {len(valid_times)} samples")
     
     # Compute evaluation metrics
     print_header("COMPUTING EVALUATION METRICS")

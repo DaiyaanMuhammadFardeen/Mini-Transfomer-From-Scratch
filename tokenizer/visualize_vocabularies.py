@@ -3,21 +3,60 @@ Script to visualize both diff and message vocabularies after they have been trai
 """
 import pickle
 import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
-from visualization import generate_comprehensive_report
+# from visualization import generate_comprehensive_report  # Commented out - module not available
+
+
+class PickleModuleRedirector(pickle.Unpickler):
+    """Redirect old module paths to new ones during unpickling."""
+    def find_class(self, module, name):
+        if module == 'Vocabulary':
+            try:
+                from tokenizer.DiffVocabulary import DiffVocabulary
+                if name == 'DiffVocabulary' or name == 'Vocabulary':
+                    return DiffVocabulary
+            except:
+                pass
+            try:
+                from tokenizer.MsgVocabulary import MsgVocabulary
+                if name == 'MsgVocabulary' or name == 'Vocabulary':
+                    return MsgVocabulary
+            except:
+                pass
+        elif module in ('DiffVocabulary', 'tokenizer.diff_text.Vocabulary'):
+            from tokenizer.DiffVocabulary import DiffVocabulary
+            return DiffVocabulary
+        elif module in ('MsgVocabulary', 'tokenizer.message.Vocabulary'):
+            from tokenizer.MsgVocabulary import MsgVocabulary
+            return MsgVocabulary
+        return super().find_class(module, name)
+
+
+def load_pickle_with_redirect(file_path):
+    """Load pickle file with module path redirection."""
+    print(f"Loading pickle from {file_path} with module redirection")
+    with open(file_path, 'rb') as f:
+        unpickler = PickleModuleRedirector(f)
+        try:
+            obj = unpickler.load()
+            print(f"✅ Successfully loaded {file_path}")
+            return obj
+        except Exception as e:
+            print(f"⚠️  Failed to load with redirection, trying standard pickle: {e}")
+            f.seek(0)
+            obj = pickle.load(f)
+            return obj
 
 
 def load_vocabularies(diff_vocab_path: str = "diff_vocab.pkl", msg_vocab_path: str = "message_vocab.pkl"):
-    """Load both vocabularies from pickle files."""
+    """Load both vocabularies from pickle files with module path redirection."""
     print("Loading vocabularies...")
     
-    with open(diff_vocab_path, 'rb') as f:
-        diff_vocab = pickle.load(f)
-    
-    with open(msg_vocab_path, 'rb') as f:
-        msg_vocab = pickle.load(f)
+    diff_vocab = load_pickle_with_redirect(diff_vocab_path)
+    msg_vocab = load_pickle_with_redirect(msg_vocab_path)
     
     print(f"Loaded DiffVocabulary with {len(diff_vocab.stoi)} tokens")
     print(f"Loaded MsgVocabulary with {len(msg_vocab.stoi)} tokens")
@@ -165,7 +204,7 @@ def main():
         print("2. python generateMsgToken.py")
         return
     
-    # Sample texts for visualization
+    # Sample texts for visualization (reserved for future use)
     sample_texts = [
         "Fix security vulnerability in JWT authentication with Python Django and PostgreSQL",
         "Add new feature for user authentication using React and Node.js",
@@ -174,12 +213,13 @@ def main():
         "Add unit tests for authentication module with Jest framework"
     ]
     
+    # Note: generate_comprehensive_report is commented out as the visualization module is not available
     # Generate comprehensive visualizations (existing)
-    generate_comprehensive_report(
-        diff_vocab, "DiffVocabulary", 
-        msg_vocab, "MsgVocabulary", 
-        sample_texts
-    )
+    # generate_comprehensive_report(
+    #     diff_vocab, "DiffVocabulary", 
+    #     msg_vocab, "MsgVocabulary", 
+    #     sample_texts
+    # )
     
     # NEW: Plot A - Vocabulary Coverage
     print("\nGenerating vocabulary coverage plot...")

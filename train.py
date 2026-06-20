@@ -8,6 +8,7 @@ import os
 import sys
 import argparse
 import csv
+import gc
 from torch.utils.data import DataLoader, random_split
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
@@ -299,7 +300,7 @@ def main(args):
     train_sampler = CurriculumSampler(
         lengths=train_lengths,
         batch_size=batch_size,
-        bucket_size=batch_size * 100,
+        bucket_size=batch_size * 50,  # Reduced bucket size to save memory
         warmup_epochs=1,  # First epoch uses shortest 50% of data
         current_epoch=start_epoch,
         shuffle=True
@@ -315,14 +316,13 @@ def main(args):
     )
     val_dataloader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=max(1, batch_size // 4),   # halve again: 16 instead of 32
         shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-        prefetch_factor=2,
-        persistent_workers=True
+        num_workers=0,                          # run in main process, no worker RAM
+        pin_memory=False,                       # no point pinning without workers
+        # remove persistent_workers and prefetch_factor entirely
     )
-    print(f"\033[92m✓ DataLoaders created with bucket batching, batch_size: {batch_size}, num_workers=2\033[0m", file=sys.stderr)
+    print(f"\033[92m✓ DataLoaders created with bucket batching, batch_size: {batch_size}, train_workers=2, val_workers=0\033[0m", file=sys.stderr)
 
     print("\033[94m🤖 Initializing Transformer model\033[0m", file=sys.stderr)
     transformer = Transformer(
@@ -373,7 +373,7 @@ def main(args):
     # Use AdamW with correct decoupled weight decay (Loshchilov & Hutter 2017)
     optimizer = optim.AdamW(
         transformer.parameters(),
-        lr=3e-4,  # Max LR for OneCycleLR
+        lr=args.learning_rate,  # Max LR for OneCycleLR
         betas=(0.9, 0.98),
         eps=1e-9,
         weight_decay=0.01  # Standard for transformers
@@ -385,11 +385,11 @@ def main(args):
     
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=3e-4,              # Peak LR
+        max_lr=args.learning_rate,              # Peak LR
         total_steps=total_steps,
-        pct_start=0.1,            # 10% of training for warmup
+        pct_start=0.05,            # 10% of training for warmup
         anneal_strategy='cos',    # Cosine decay
-        div_factor=25.0,          # Initial LR = max_lr / 25
+        div_factor=10.0,          # Initial LR = max_lr / 25
         final_div_factor=1e4      # Final LR = max_lr / 10000
     )
     
@@ -447,6 +447,10 @@ def main(args):
             global_step = state.get('global_step', 0)
             best_val_loss = state.get('best_val_loss', float('inf'))
             resume_batch_idx = state.get('batch_idx', 0)
+            
+            # Restore saver's internal counter
+            saver.restore_state(state.get('saver_last_saved_step', global_step))
+            print(f" QuickSaver synced to last_saved_step={saver.last_saved_step}", file=sys.stderr)
             print(f"\033[95m🔥 Resumed from step {global_step}, epoch {start_epoch}\033[0m", file=sys.stderr)
     elif args.resume:
         # Legacy manual resume (deprecated but kept for compatibility)
@@ -486,14 +490,17 @@ def main(args):
         import itertools
         batch_iter = iter(pbar)
         
-        if epoch == start_epoch and resume_batch_idx > 0:
-            print(f" Fast-forwarding {resume_batch_idx} batches...", file=sys.stderr)
+        # Reset resume skip after the first resumed epoch
+        _skip_batches = resume_batch_idx if epoch == start_epoch else 0
+        
+        if _skip_batches > 0:
+            print(f" Fast-forwarding {_skip_batches} batches...", file=sys.stderr)
             consumed = 0
-            for _ in itertools.islice(batch_iter, resume_batch_idx):
+            for _ in itertools.islice(batch_iter, _skip_batches):
                 consumed += 1
             print(f" Skipped {consumed} batches", file=sys.stderr)
         
-        for batch_idx, batch_data in enumerate(batch_iter, start=resume_batch_idx):
+        for batch_idx, batch_data in enumerate(batch_iter, start=_skip_batches):
             
             # Unpack batch data - now includes change_features
             if len(batch_data) == 3:
@@ -597,56 +604,77 @@ def main(args):
         avg_train_loss = total_train_loss / len(train_dataloader)
         print(f"\033[92m✓ Epoch {epoch+1}: Train loss: {avg_train_loss:.4f}\033[0m", file=sys.stderr)
 
+        # === MEMORY CLEANUP BEFORE VALIDATION ===
+        # 1. Explicitly free last-batch tensors
+        del src_data, tgt_data
+        if 'output' in dir(): del output
+        if 'loss' in dir(): del loss
+        if 'ce_loss' in dir(): del ce_loss
+        
+        # 2. Kill train workers and flush CUDA cache
+        train_dataloader._iterator = None  # kills prefetch queue
+        torch.cuda.empty_cache()
+        gc.collect()
+        print(f"\033[92m✓ Memory cleanup completed before validation\033[0m", file=sys.stderr)
+
         # Validation loop using EMA model for better generalization
         ema.model.to(device)
         ema.model.eval()
         total_val_loss = 0
         print(f"\033[96m▶️  Starting validation batch iteration for epoch {epoch+1}\033[0m", file=sys.stderr)
-        with torch.no_grad():
-            pbar = tqdm(val_dataloader, 
-                        desc=f"Epoch {epoch+1}/{num_epochs} Val", 
-                        position=0, 
-                        leave=True,
-                        unit="batch",
-                        dynamic_ncols=True)
-            for batch_data in pbar:
-                # Unpack batch data - now includes change_features
-                if len(batch_data) == 3:
-                    src_data, tgt_data, change_features = batch_data
-                else:
-                    # Backward compatibility with old 2-tuple format
-                    src_data, tgt_data = batch_data
-                    change_features = None
-                
-                src_data = src_data.to(device)
-                tgt_data = tgt_data.to(device)
-                if change_features is not None:
-                    change_features = change_features.to(device)
-                
-                from torch.nn.attention import sdpa_kernel, SDPBackend
-                with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
-                    if use_bfloat16:
-                        with torch.autocast("cuda", dtype=torch.bfloat16):
-                            output = ema.model(src_data, tgt_data[:, :-1], change_features)
-                            loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+        try:
+            with torch.no_grad():
+                pbar = tqdm(val_dataloader, 
+                            desc=f"Epoch {epoch+1}/{num_epochs} Val", 
+                            position=0, 
+                            leave=True,
+                            unit="batch",
+                            dynamic_ncols=True)
+                for batch_data in pbar:
+                    # Unpack batch data - now includes change_features
+                    if len(batch_data) == 3:
+                        src_data, tgt_data, change_features = batch_data
                     else:
-                        with autocast("cuda"):
-                            output = ema.model(src_data, tgt_data[:, :-1], change_features)
-                            loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
-                total_val_loss += loss.item()
-                pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+                        # Backward compatibility with old 2-tuple format
+                        src_data, tgt_data = batch_data
+                        change_features = None
+                    
+                    src_data = src_data.to(device)
+                    tgt_data = tgt_data.to(device)
+                    if change_features is not None:
+                        change_features = change_features.to(device)
+                    
+                    from torch.nn.attention import sdpa_kernel, SDPBackend
+                    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                        if use_bfloat16:
+                            with torch.autocast("cuda", dtype=torch.bfloat16):
+                                output = ema.model(src_data, tgt_data[:, :-1], change_features)
+                                loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+                        else:
+                            with autocast("cuda"):
+                                output = ema.model(src_data, tgt_data[:, :-1], change_features)
+                                loss = criterion(output.contiguous().view(-1, tgt_vocab_size), tgt_data[:, 1:].contiguous().view(-1))
+                    total_val_loss += loss.item()
+                    pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+                    
+                    # Free each batch immediately
+                    del src_data, tgt_data, output, loss
+                    if change_features is not None:
+                        del change_features
+        finally:
+            # Always clean up after val
+            torch.cuda.empty_cache()
+            gc.collect()
 
         avg_val_loss = total_val_loss / len(val_dataloader)
         print(f"\033[92m✓ Epoch {epoch+1}: Validation loss: {avg_val_loss:.4f}\033[0m", file=sys.stderr)
         # Noam scheduler doesn't need epoch-level stepping
         
-        # Update validation loss in CSV log (update last row for this epoch)
-        import pandas as pd
-        df_log = pd.read_csv(log_path)
-        epoch_mask = df_log['epoch'] == epoch + 1
-        if epoch_mask.any():
-            df_log.loc[epoch_mask, 'val_loss'] = avg_val_loss
-            df_log.to_csv(log_path, index=False)
+        # Update validation loss in CSV log (append summary row instead of reading entire file)
+        with open(log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch+1, global_step, '', avg_val_loss, 
+                             optimizer.param_groups[0]['lr'], 0])
 
         # Save epoch checkpoint using QuickSaver
         saver.save_epoch(
@@ -678,16 +706,16 @@ if __name__ == "__main__":
     parser.add_argument("--message-vocab-path", default="./tokenizer/message_vocab.pkl", help="Path to message vocabulary")
     parser.add_argument("--checkpoint-dir", default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--d-model", type=int, default=512, help="Model dimension")
-    parser.add_argument("--num-heads", type=int, default=16, help="Number of attention heads")
+    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--num-layers", type=int, default=2, help="Number of transformer layers")
     parser.add_argument("--d-ff", type=int, default=2048, help="Feed-forward dimension")
     parser.add_argument("--max-seq-length", type=int, default=256, help="Maximum sequence length") #avg for diff is 128, for message is 12, max is 120. It used to be 1024
-    parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
-    parser.add_argument("--batch-size", type=int, default=64, help="Effective batch size (micro_batch × accumulation_steps)")
-    parser.add_argument("--micro-batch-size", type=int, default=8, help="Per-step batch size (memory budget)")
+    parser.add_argument("--dropout", type=float, default=0.15, help="Dropout rate")
+    parser.add_argument("--batch-size", type=int, default=8, help="Effective batch size (micro_batch × accumulation_steps)")
+    parser.add_argument("--micro-batch-size", type=int, default=16, help="Per-step batch size (memory budget)")
     parser.add_argument("--accumulation-steps", type=int, default=8, help="Accumulate this many micro-batches before optimizer step")
-    parser.add_argument("--num-epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--learning-rate", type=float, default=0.00001, help="Learning rate")
+    parser.add_argument("--num-epochs", type=int, default=1, help="Number of epochs")
+    parser.add_argument("--learning-rate", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--quicksave-every", type=int, default=300,
                         help="Save checkpoint every N training steps")
     parser.add_argument("--auto-resume", action="store_true",

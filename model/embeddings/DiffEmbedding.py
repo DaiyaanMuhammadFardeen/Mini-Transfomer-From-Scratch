@@ -33,11 +33,11 @@ class DiffEmbedding(nn.Module):
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, token_ids: torch.Tensor,
-                change_features: torch.Tensor) -> torch.Tensor:
+                change_features: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             token_ids:       (batch, seq_len) long tensor
-            change_features: (batch, 6) float tensor from CodeDiffDataset
+            change_features: (batch, 6) float tensor from CodeDiffDataset (optional)
 
         Returns:
             (batch, seq_len, d_model) encoder input tensor

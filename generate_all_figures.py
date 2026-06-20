@@ -73,6 +73,9 @@ def main(args):
                 print("⚠️  word_freqs not available, skipping vocab plots")
         else:
             print("⚠️  Vocabulary files not found, skipping")
+    except ImportError as e:
+        print(f"⚠️  Skipped (import error: {e})")
+        print("   This is expected if visualization dependencies are missing.")
     except Exception as e:
         print(f"⚠️  Skipped (error: {e})")
     
@@ -91,7 +94,7 @@ def main(args):
     # 4. Token length distributions (requires dataset)
     print("\n[4/8] Token length distributions...")
     try:
-        from tokenizer.visualize_vocabularies import plot_token_distributions
+        from tokenizer.visualize_vocabularies import plot_token_distributions, load_pickle_with_redirect
         
         if os.path.exists(args.parquet):
             print("   Loading dataset to compute token lengths...")
@@ -102,22 +105,22 @@ def main(args):
             msg_vocab_path = args.msg_vocab if hasattr(args, 'msg_vocab') else "./tokenizer/message_vocab.pkl"
             
             if os.path.exists(diff_vocab_path) and os.path.exists(msg_vocab_path):
-                with open(diff_vocab_path, 'rb') as f:
-                    diff_vocab = pickle.load(f)
-                with open(msg_vocab_path, 'rb') as f:
-                    msg_vocab = pickle.load(f)
+                # Use module redirector to load vocabularies
+                diff_vocab = load_pickle_with_redirect(diff_vocab_path)
+                msg_vocab = load_pickle_with_redirect(msg_vocab_path)
                 
                 # Sample subset for speed
                 sample_size = min(1000, len(df))
                 df_sample = df.head(sample_size)
                 
-                # Compute tokenized lengths
+                # Compute tokenized lengths - handle both column name variants
                 diff_lengths = []
                 msg_lengths = []
                 
                 for _, row in df_sample.iterrows():
                     diff_text = str(row.get('diff_text', ''))
-                    msg_text = str(row.get('message', ''))
+                    # Try multiple possible column names for messages
+                    msg_text = str(row.get('message', row.get('commit_message', row.get('reference_message', ''))))
                     
                     # Simple whitespace tokenization as approximation
                     diff_tokens = diff_text.split()
@@ -136,6 +139,9 @@ def main(args):
                 print("⚠️  Vocabulary files not found, skipping")
         else:
             print(f"⚠️  Parquet file not found: {args.parquet}")
+    except ImportError as e:
+        print(f"⚠️  Skipped (import error: {e})")
+        print("   This is expected if visualization dependencies are missing.")
     except Exception as e:
         print(f"⚠️  Skipped (error: {e})")
     
@@ -162,8 +168,9 @@ def main(args):
         
         if os.path.exists(args.predictions):
             pred_df = pd.read_csv(args.predictions)
-            refs = pred_df['message'].fillna('').tolist()
-            hyps = pred_df['predicted_message'].fillna('').tolist()
+            # Handle different column naming conventions
+            refs = pred_df['reference_message'].fillna('').tolist() if 'reference_message' in pred_df.columns else pred_df['message'].fillna('').tolist()
+            hyps = pred_df['generated_message'].fillna('').tolist() if 'generated_message' in pred_df.columns else pred_df['predicted_message'].fillna('').tolist()
             
             plot_length_analysis(refs, hyps, output=fig("06_length_analysis.png"))
             print("✅ Length analysis generated")
@@ -180,15 +187,69 @@ def main(args):
         if os.path.exists(args.predictions):
             pred_df = pd.read_csv(args.predictions)
             
+            # Find the sample with highest BLEU score for each algorithm
+            # Group by algorithm and find best example per algorithm
             examples = []
-            for i in range(min(8, len(pred_df))):
-                row = pred_df.iloc[i]
-                examples.append({
-                    'diff': str(row.get('diff_text', ''))[:80],
-                    'reference': str(row.get('message', '')),
-                    'predicted': str(row.get('predicted_message', '')),
-                    'bleu': 0.0  # Would need per-example BLEU scores
-                })
+            
+            # Check which column has the algorithm info
+            if 'algorithm' in pred_df.columns:
+                # Get unique algorithms
+                algorithms = pred_df['algorithm'].unique()
+                
+                for algo in algorithms[:8]:  # Limit to first 8 algorithms
+                    # Filter for this algorithm and get highest BLEU
+                    algo_df = pred_df[pred_df['algorithm'] == algo]
+                    
+                    # Try different BLEU column names
+                    bleu_col = None
+                    for col in ['bleu_4', 'bleu', 'BLEU', 'corpus_bleu_4']:
+                        if col in algo_df.columns:
+                            bleu_col = col
+                            break
+                    
+                    if bleu_col:
+                        # Get row with highest BLEU for this algorithm
+                        best_idx = algo_df[bleu_col].idxmax()
+                        row = pred_df.loc[best_idx]
+                    else:
+                        # If no BLEU column, just take first example
+                        row = algo_df.iloc[0]
+                    
+                    # Handle different column naming conventions
+                    ref_msg = str(row.get('reference_message', row.get('message', '')))
+                    gen_msg = str(row.get('generated_message', row.get('predicted_message', '')))
+                    bleu_score = float(row.get(bleu_col, 0.0)) if bleu_col else 0.0
+                    
+                    examples.append({
+                        'diff': str(algo),  # Use algorithm name instead of diff summary
+                        'reference': ref_msg,
+                        'predicted': gen_msg,
+                        'bleu': bleu_score
+                    })
+            else:
+                # Fallback: just take top 8 rows by BLEU score
+                bleu_col = None
+                for col in ['bleu_4', 'bleu', 'BLEU', 'corpus_bleu_4']:
+                    if col in pred_df.columns:
+                        bleu_col = col
+                        break
+                
+                if bleu_col:
+                    sorted_df = pred_df.nlargest(8, bleu_col)
+                else:
+                    sorted_df = pred_df.head(8)
+                
+                for i, row in sorted_df.iterrows():
+                    ref_msg = str(row.get('reference_message', row.get('message', '')))
+                    gen_msg = str(row.get('generated_message', row.get('predicted_message', '')))
+                    bleu_score = float(row.get(bleu_col, 0.0)) if bleu_col else 0.0
+                    
+                    examples.append({
+                        'diff': f'Sample {i+1}',
+                        'reference': ref_msg,
+                        'predicted': gen_msg,
+                        'bleu': bleu_score
+                    })
             
             plot_qualitative_examples(examples, output=fig("07_qualitative_examples.png"))
             print("✅ Qualitative examples table generated")
@@ -199,9 +260,15 @@ def main(args):
     
     # 8. Attention visualization (placeholder - requires model modifications)
     print("\n[8/8] Attention visualization...")
-    print("       Note: Requires model modifications to extract attention weights.")
-    print("       See visualize_attention.py for implementation details.")
-    print("       Skipping automated generation.")
+    print("       ⚠️  SKIPPED: Requires model architecture modifications")
+    print()
+    print("       To enable attention visualization, you need to:")
+    print("       1. Modify MultiHeadAttention.scaled_dot_product_attention() to return attn_probs")
+    print("       2. Register forward hooks on attention layers during inference")
+    print("       3. Extract and save attention weights for specific examples")
+    print()
+    print("       See visualize_attention.py for detailed implementation notes.")
+    print("       This is intentionally not automated as it requires code changes.")
     
     print("\n" + "=" * 60)
     print(f"All figures saved to: {args.output_dir}")
